@@ -1,22 +1,20 @@
 import { feishuClient } from '../feishu/client.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import { opencodeClient } from '../opencode/client.js';
-import { reliabilityConfig, userConfig } from '../config.js';
-import { getRuntimeCronManager } from '../reliability/runtime-cron-registry.js';
-import { cleanupRuntimeCronJobsByConversation } from '../reliability/runtime-cron-orphan.js';
-
-export interface CleanupStats {
-  scannedChats: number;
-  disbandedChats: number;
-  deletedSessions: number;
-  skippedProtectedSessions: number;
-  removedOrphanMappings: number;
-  removedCronJobs: number;
-}
+import { reliabilityConfig, userConfig, isPlatformConfigured } from '../config.js';
+import { getRuntimeCronManager } from '../reliability/runtime-cron.js';
+import { cleanupRuntimeCronJobsByConversation } from '../reliability/runtime-cron.js';
+import type { CleanupStats } from './lifecycle-types.js';
 
 export class LifecycleHandler {
   // 启动时清理无效群
   async cleanUpOnStart(): Promise<void> {
+    // 检查飞书平台是否已配置
+    if (!isPlatformConfigured('feishu')) {
+      console.log('[Lifecycle] 飞书平台未配置，跳过启动清理');
+      return;
+    }
+
     console.log('[Lifecycle] 正在检查无效群聊...');
     const stats = await this.runCleanupScan();
     console.log(
@@ -46,6 +44,18 @@ export class LifecycleHandler {
     } else {
       for (const mappedChatId of feishuChatIds) {
         if (activeChatIdSet.has(mappedChatId)) continue;
+        
+        // 新增：跳过最近创建的群聊（保护窗口 30 秒），避免飞书 API 同步延迟导致误删
+        const session = chatSessionStore.getSession(mappedChatId);
+        if (session && session.createdAt) {
+          const ageMs = Date.now() - session.createdAt;
+          const protectionWindowMs = 30 * 1000;
+          if (ageMs < protectionWindowMs) {
+            console.log('[Lifecycle] 跳过新创建群聊（保护窗口内）: chat=' + mappedChatId);
+            continue;
+          }
+        }
+        
         if (!chatSessionStore.isGroupChatSession(mappedChatId)) {
           continue;
         }
@@ -152,3 +162,6 @@ export class LifecycleHandler {
 }
 
 export const lifecycleHandler = new LifecycleHandler();
+
+// Re-exports for backward compatibility
+export type { CleanupStats } from './lifecycle-types.js';

@@ -6,6 +6,7 @@
  */
 
 import type { PlatformAdapter } from './types.js';
+import { dingtalkConfig } from '../config/platform.js';
 
 // 环境变量前缀
 const PLATFORM_ENV_PREFIX = 'PLATFORM_';
@@ -58,7 +59,8 @@ export function list(): PlatformAdapter[] {
  *
  * 优先级：
  * 1. 环境变量 PLATFORM_{PLATFORM_ID}_ENABLED
- * 2. 默认值（feishu 默认启用，其他默认禁用）
+ * 2. 平台特定配置（如 dingtalkConfig.enabled）
+ * 3. 默认值：所有平台默认禁用
  *
  * @param platformId - 平台唯一标识
  * @returns 是否启用
@@ -73,8 +75,14 @@ function isPlatformEnabled(platformId: string): boolean {
     return ['1', 'true', 'yes', 'on'].includes(normalized);
   }
 
-  // 默认策略：feishu 默认启用，其他默认禁用
-  return platformId.toLowerCase() === 'feishu';
+  // 钉钉使用统一配置
+  if (platformId === 'dingtalk') {
+    return dingtalkConfig.enabled;
+  }
+
+  // 默认策略：所有平台默认禁用
+  // 平台启动由各适配器的 start() 方法根据配置决定
+  return false;
 }
 
 /**
@@ -101,3 +109,19 @@ export function isEnabled(platformId: string): boolean {
   }
   return isPlatformEnabled(platformId);
 }
+
+// ──────────────────────────────────────────────
+// 平台适配器注册
+// ──────────────────────────────────────────────
+
+import { qqAdapter } from './adapters/qq-adapter.js';
+import { whatsappAdapter } from './adapters/whatsapp-adapter.js';
+import { telegramAdapter } from './adapters/telegram-adapter.js';
+import { weixinAdapter } from './adapters/weixin-adapter.js';
+import { dingtalkAdapter } from './adapters/dingtalk/dingtalk-adapter.js';
+
+register(qqAdapter);
+register(whatsappAdapter);
+register(telegramAdapter);
+register(weixinAdapter);
+register(dingtalkAdapter);

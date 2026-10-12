@@ -1,0 +1,1417 @@
+/**
+ * QQ 消息处理器
+ *
+ * 参考 telegram.ts 的结构，处理 QQ 消息
+ * 支持基础命令：/help, /status, /session, /model, /agent, /clear, /stop 等
+ */
+
+import { modelConfig, attachmentConfig } from '../config.js';
+import { opencodeClient } from '../opencode/client.js';
+import { preprocessVisionParts, type VisionPart } from '../services/vision-ocr.js';
+import { outputBuffer } from '../opencode/output-buffer.js';
+import { chatSessionStore, type SessionOrderMode } from '../store/chat-session.js';
+import { parseCommand, type ParsedCommand } from '../commands/parser.js';
+import { normalizeEffortLevel, type EffortLevel } from '../commands/effort.js';
+import { DirectoryPolicy } from '../utils/directory-policy.js';
+import { buildSessionTimestamp } from '../utils/session-title.js';
+import { shouldSkipGroupMessage } from '../utils/group-mention.js';
+import { permissionHandler } from '../permissions/handler.js';
+import { questionHandler, type PendingQuestion } from '../opencode/question-handler.js';
+import { parseQuestionAnswerText } from '../opencode/question-parser.js';
+import type { PlatformMessageEvent, PlatformSender } from '../platform/types.js';
+import {
+  collectAllowedChatModels,
+  findAllowedChatModel,
+  isChatModelAllowed,
+  parseChatModelReference,
+} from '../utils/chat-model-whitelist.js';
+import { randomUUID } from 'crypto';
+import path from 'path';
+import { promises as fs } from 'fs';
+import axios from 'axios';
+
+import {
+  ATTACHMENT_BASE_DIR,
+  ALLOWED_ATTACHMENT_EXTENSIONS,
+  QQ_CARD_SOFT_LIMIT,
+  type OpencodeFilePartInput,
+  type OpencodePartInput,
+  type PermissionDecision,
+  type QQSessionInfo,
+} from './qq-types.js';
+
+import {
+  extractExtension,
+  normalizeExtension,
+  extensionFromContentType,
+  mimeFromExtension,
+  sanitizeFilename,
+  parsePermissionDecision,
+  getQQHelpText,
+  getQQHelpMarkdown,
+  buildQQCmdInput,
+} from './qq-utils.js';
+
+
+export class QQHandler {
+  private getSessionOrderMode(chatId: string): SessionOrderMode {
+    return chatSessionStore.getSessionByConversation('qq', chatId)?.sessionOrderMode || 'default';
+  }
+
+  private formatSessionOrderMode(mode: SessionOrderMode): string {
+    return mode === 'last_time' ? '按最后修改时间倒序' : '默认排序';
+  }
+
+  private isQQOnlyTextEnabled(chatId: string): boolean {
+    return chatSessionStore.getSessionByConversation('qq', chatId)?.qqOutputOnlyText === true;
+  }
+
+  private getSessionLastModifiedTime(session: QQSessionInfo): number {
+    return session.time?.updated ?? session.time?.created ?? 0;
+  }
+
+  private async resolveSessionLastActivityMap(sessions: QQSessionInfo[]): Promise<Map<string, number>> {
+    const entries = await Promise.all(
+      sessions.map(async session => {
+        try {
+          const activityTime = await opencodeClient.getSessionLastActivityTime(session.id);
+          return [session.id, activityTime || this.getSessionLastModifiedTime(session)] as const;
+        } catch {
+          return [session.id, this.getSessionLastModifiedTime(session)] as const;
+        }
+      })
+    );
+
+    return new Map(entries);
+  }
+
+  private async sortSessions(chatId: string, sessions: QQSessionInfo[]): Promise<QQSessionInfo[]> {
+    const sessionOrderMode = this.getSessionOrderMode(chatId);
+    const sessionLastActivityMap = sessionOrderMode === 'last_time'
+      ? await this.resolveSessionLastActivityMap(sessions)
+      : null;
+
+    return [...sessions].sort((a, b) => {
+      if (sessionOrderMode === 'last_time') {
+        const left = sessionLastActivityMap?.get(a.id) ?? this.getSessionLastModifiedTime(a);
+        const right = sessionLastActivityMap?.get(b.id) ?? this.getSessionLastModifiedTime(b);
+        if (left !== right) return right - left;
+        return a.id.localeCompare(b.id, 'en');
+      }
+
+      const directoryCompare = (a.directory || '/').localeCompare((b.directory || '/'), 'zh-Hans-CN');
+      if (directoryCompare !== 0) return directoryCompare;
+      const left = this.getSessionLastModifiedTime(b);
+      const right = this.getSessionLastModifiedTime(a);
+      if (left !== right) return left - right;
+      return a.id.localeCompare(b.id, 'en');
+    });
+  }
+
+  private async sendQQCard(
+    chatId: string,
+    sender: PlatformSender,
+    payload: { markdown: string; qqText: string }
+  ): Promise<void> {
+    if (this.isQQOnlyTextEnabled(chatId)) {
+      await sender.sendCard(chatId, {
+        qqText: payload.qqText,
+        forcePlainText: true,
+      });
+      return;
+    }
+
+    await sender.sendCard(chatId, payload);
+  }
+
+  private async sendQQPagedCard(
+    chatId: string,
+    sender: PlatformSender,
+    introMarkdownLines: string[],
+    introTextLines: string[],
+    sections: Array<{ markdown: string; text: string }>
+  ): Promise<void> {
+    if (sections.length === 0) {
+      await this.sendQQCard(chatId, sender, {
+        markdown: introMarkdownLines.join('\n'),
+        qqText: introTextLines.join('\n'),
+      });
+      return;
+    }
+
+    const pages: Array<{ markdown: string; qqText: string }> = [];
+    let currentMarkdown = introMarkdownLines.join('\n');
+    let currentText = introTextLines.join('\n');
+
+    const pushPage = (): void => {
+      pages.push({ markdown: currentMarkdown, qqText: currentText });
+      currentMarkdown = introMarkdownLines.join('\n');
+      currentText = introTextLines.join('\n');
+    };
+
+    for (const section of sections) {
+      const nextMarkdown = currentMarkdown ? `${currentMarkdown}\n${section.markdown}` : section.markdown;
+      const nextText = currentText ? `${currentText}\n${section.text}` : section.text;
+
+      if (nextMarkdown.length > QQ_CARD_SOFT_LIMIT || nextText.length > QQ_CARD_SOFT_LIMIT) {
+        if (currentMarkdown !== introMarkdownLines.join('\n') || currentText !== introTextLines.join('\n')) {
+          pushPage();
+        }
+
+        if (section.markdown.length > QQ_CARD_SOFT_LIMIT || section.text.length > QQ_CARD_SOFT_LIMIT) {
+          pages.push({ markdown: section.markdown, qqText: section.text });
+          continue;
+        }
+
+        currentMarkdown = introMarkdownLines.join('\n');
+        currentText = introTextLines.join('\n');
+      }
+
+      currentMarkdown = currentMarkdown ? `${currentMarkdown}\n${section.markdown}` : section.markdown;
+      currentText = currentText ? `${currentText}\n${section.text}` : section.text;
+    }
+
+    if (currentMarkdown !== introMarkdownLines.join('\n') || currentText !== introTextLines.join('\n')) {
+      pages.push({ markdown: currentMarkdown, qqText: currentText });
+    }
+
+    for (const page of pages) {
+      await this.sendQQCard(chatId, sender, page);
+    }
+  }
+
+  private ensureStreamingBuffer(chatId: string, sessionId: string): void {
+    const key = `chat:qq:${chatId}`;
+    const current = outputBuffer.get(key);
+    if (current && current.status !== 'running') {
+      outputBuffer.clear(key);
+    }
+
+    if (!outputBuffer.get(key)) {
+      outputBuffer.getOrCreate(key, chatId, sessionId, null);
+    }
+  }
+
+  private formatDispatchError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+
+    if (normalized.includes('fetch failed') || normalized.includes('networkerror')) {
+      return '与 OpenCode 的连接失败，请检查服务是否在线或网络是否超时';
+    }
+
+    if (normalized.includes('timed out') || normalized.includes('timeout')) {
+      return '请求 OpenCode 超时，请稍后重试';
+    }
+
+    return `请求失败：${message}`;
+  }
+
+  /**
+   * 构建权限请求文本消息
+   */
+  private buildPermissionRequestText(tool: string, description: string, risk?: string): string {
+    const riskText = risk === 'high' ? '⚠️ 高风险' : risk === 'medium' ? '⚡ 中等风险' : '✅ 低风险';
+    return `🔐 权限确认请求
+
+工具名称: ${tool}
+操作描述: ${description}
+风险等级: ${riskText}
+
+请回复以下选项之一:
+1 - 允许
+2 - 拒绝
+3 - 始终允许此工具
+
+也可以直接回复: 允许 / 拒绝 / 始终允许 (或 y / n / always)`;
+  }
+
+  /**
+   * 尝试处理待确认的权限请求
+   * 返回 true 表示已处理（消息是权限响应），false 表示未处理
+   */
+  private async tryHandlePendingPermission(
+    chatId: string,
+    content: string,
+    sender: PlatformSender
+  ): Promise<boolean> {
+    const permissionChatKey = `qq:${chatId}`;
+    const pending = permissionHandler.peekForChat(permissionChatKey);
+    if (!pending) return false;
+
+    const decision = parsePermissionDecision(content);
+    if (!decision) {
+      // 提示用户如何回复
+      await sender.sendText(
+        chatId,
+        '当前有待确认权限，请回复:\n1 或 允许 - 同意\n2 或 拒绝 - 不同意\n3 或 始终允许 - 同意并记住此工具'
+      );
+      return true;
+    }
+
+    // 收集候选 session IDs
+    const candidateSessionIds = Array.from(
+      new Set(
+        [pending.sessionId, pending.parentSessionId, pending.relatedSessionId]
+          .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      )
+    );
+
+    // 获取权限目录选项
+    const resolvePermissionDirectoryOptions = (sessionId: string): { directory?: string; fallbackDirectories?: string[] } => {
+      const conversation = chatSessionStore.getConversationBySessionId(sessionId);
+      const boundSession = conversation
+        ? chatSessionStore.getSessionByConversation(conversation.platform, conversation.conversationId)
+        : undefined;
+      const queueHintSession = chatSessionStore.getSession(chatId);
+
+      const directory = boundSession?.resolvedDirectory
+        || queueHintSession?.resolvedDirectory
+        || boundSession?.defaultDirectory
+        || queueHintSession?.defaultDirectory;
+
+      const fallbackDirectories = Array.from(
+        new Set(
+          [
+            boundSession?.resolvedDirectory,
+            boundSession?.defaultDirectory,
+            queueHintSession?.resolvedDirectory,
+            queueHintSession?.defaultDirectory,
+            ...chatSessionStore.getKnownDirectories(),
+          ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        )
+      );
+
+      return {
+        ...(directory ? { directory } : {}),
+        ...(fallbackDirectories.length > 0 ? { fallbackDirectories } : {}),
+      };
+    };
+
+    // 尝试每个候选 session，直到成功
+    let responded = false;
+    let respondedSessionId = pending.sessionId;
+    let lastError: unknown;
+    let expiredDetected = false;
+
+    for (const candidateSessionId of candidateSessionIds) {
+      const permissionDirectoryOptions = resolvePermissionDirectoryOptions(candidateSessionId);
+      try {
+        const result = await opencodeClient.respondToPermission(
+          candidateSessionId,
+          pending.permissionId,
+          decision.allow,
+          decision.remember,
+          permissionDirectoryOptions
+        );
+        if (result.ok) {
+          responded = true;
+          respondedSessionId = candidateSessionId;
+          break;
+        }
+        if (result.expired) {
+          expiredDetected = true;
+        }
+      } catch (error) {
+        lastError = error;
+        console.error(`[QQ] 权限响应失败: session=${candidateSessionId}, permission=${pending.permissionId}`, error);
+      }
+    }
+
+    if (!responded) {
+      console.error(`[QQ] 所有候选 session 权限响应失败: sessions=${candidateSessionIds.join(',')}`, lastError);
+      if (expiredDetected) {
+        await sender.sendText(chatId, '操作已过期，请重新发起');
+      } else {
+        await sender.sendText(chatId, '权限响应失败，请重试');
+      }
+      return true;
+    }
+
+    console.log(
+      `[QQ] 权限响应成功: session=${respondedSessionId}, permission=${pending.permissionId}, allow=${decision.allow}, remember=${decision.remember}`
+    );
+
+    // 从队列移除
+    permissionHandler.resolveForChat(permissionChatKey, pending.permissionId);
+
+    // 更新 buffer
+    const bufferKey = `chat:qq:${chatId}`;
+    if (!outputBuffer.get(bufferKey)) {
+      outputBuffer.getOrCreate(bufferKey, chatId, respondedSessionId, null);
+    }
+
+    const resultText = decision.allow
+      ? decision.remember ? `✅ 已允许并记住权限：${pending.tool}` : `✅ 已允许权限：${pending.tool}`
+      : `❌ 已拒绝权限：${pending.tool}`;
+
+    outputBuffer.append(bufferKey, `\n\n${resultText}`);
+    outputBuffer.touch(bufferKey);
+
+    await sender.sendText(
+      chatId,
+      decision.allow ? (decision.remember ? '已允许并记住该权限' : '已允许该权限') : '已拒绝该权限'
+    );
+    return true;
+  }
+
+  /**
+   * 发送权限请求通知
+   */
+  async sendPermissionRequest(
+    chatId: string,
+    tool: string,
+    description: string,
+    risk: string | undefined,
+    sender: PlatformSender
+  ): Promise<void> {
+    const text = this.buildPermissionRequestText(tool, description, risk);
+    await sender.sendText(chatId, text);
+  }
+
+  /**
+   * 尝试处理待回答的问题
+   * 返回 true 表示已处理（消息是问答回复），false 表示未处理
+   */
+  private async tryHandlePendingQuestion(
+    chatId: string,
+    content: string,
+    sender: PlatformSender
+  ): Promise<boolean> {
+    const conversationKey = `chat:qq:${chatId}`;
+    const pending = questionHandler.getByConversationKey(conversationKey);
+    if (!pending) return false;
+
+    const currentIndex = pending.currentQuestionIndex;
+    const question = pending.request.questions[currentIndex];
+    if (!question) {
+      questionHandler.remove(pending.request.id);
+      return false;
+    }
+
+    // 解析答案
+    const parsed = parseQuestionAnswerText(content, question);
+    if (!parsed) {
+      await sender.sendText(chatId, '未识别答案，请回复选项编号或直接输入自定义内容。');
+      return true;
+    }
+
+    // 更新草稿
+    if (parsed.type === 'skip') {
+      questionHandler.setDraftAnswer(pending.request.id, currentIndex, []);
+      questionHandler.setDraftCustomAnswer(pending.request.id, currentIndex, '');
+    } else if (parsed.type === 'custom') {
+      questionHandler.setDraftAnswer(pending.request.id, currentIndex, []);
+      questionHandler.setDraftCustomAnswer(pending.request.id, currentIndex, parsed.custom || content);
+    } else {
+      questionHandler.setDraftCustomAnswer(pending.request.id, currentIndex, '');
+      questionHandler.setDraftAnswer(pending.request.id, currentIndex, parsed.values || []);
+    }
+
+    // 进入下一题或提交
+    const nextIndex = currentIndex + 1;
+    if (nextIndex < pending.request.questions.length) {
+      questionHandler.setCurrentQuestionIndex(pending.request.id, nextIndex);
+
+      // 发送下一题提示
+      const nextQuestion = pending.request.questions[nextIndex];
+      const questionNum = nextIndex + 1;
+      const totalQuestions = pending.request.questions.length;
+      const lines: string[] = [`✅ 已记录第 ${currentIndex + 1}/${totalQuestions} 题的回答`];
+      lines.push(`\n【问题 ${questionNum}/${totalQuestions}】`);
+      if (nextQuestion.header) {
+        lines.push(nextQuestion.header);
+      }
+      if (nextQuestion.question) {
+        lines.push(nextQuestion.question);
+      }
+      if (nextQuestion.options && nextQuestion.options.length > 0) {
+        lines.push('\n选项：');
+        for (let j = 0; j < nextQuestion.options.length; j++) {
+          const option = nextQuestion.options[j];
+          lines.push(`  ${j + 1}. ${option.label}${option.description ? ` - ${option.description}` : ''}`);
+        }
+        if (nextQuestion.multiple) {
+          lines.push('（可多选，用空格或逗号分隔多个编号）');
+        }
+      }
+      lines.push('\n请回复选项编号或输入自定义答案');
+
+      await sender.sendText(chatId, lines.join('\n'));
+      outputBuffer.touch(conversationKey);
+    } else {
+      // 提交所有答案
+      await this.submitQuestionAnswers(pending, chatId, sender);
+    }
+
+    return true;
+  }
+
+  /**
+   * 提交问题答案
+   */
+  private async submitQuestionAnswers(
+    pending: PendingQuestion,
+    chatId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    const answers: string[][] = [];
+    const totalQuestions = pending.request.questions.length;
+
+    for (let i = 0; i < totalQuestions; i++) {
+      const custom = (pending.draftCustomAnswers[i] || '').trim();
+      if (custom) {
+        answers.push([custom]);
+      } else {
+        answers.push(pending.draftAnswers[i] || []);
+      }
+    }
+
+    console.log(`[QQ] 提交问题回答: requestId=${pending.request.id.slice(0, 8)}...`);
+
+    const bufferKey = `chat:qq:${chatId}`;
+    this.ensureStreamingBuffer(chatId, pending.request.sessionID);
+
+    const result = await opencodeClient.replyQuestion(pending.request.id, answers);
+
+    if (result.ok) {
+      questionHandler.remove(pending.request.id);
+      outputBuffer.touch(bufferKey);
+      await sender.sendText(chatId, '✅ 已提交回答，AI 正在处理...');
+    } else if (result.expired) {
+      questionHandler.remove(pending.request.id);
+      await sender.sendText(chatId, '⚠️ 问题已过期，请重新发起对话');
+    } else {
+      await sender.sendText(chatId, '⚠️ 回答提交失败，请重试');
+    }
+  }
+
+  /**
+   * 处理 QQ 命令
+   */
+  private async handleCommand(
+    command: ParsedCommand,
+    chatId: string,
+    senderId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    switch (command.type) {
+      case 'help':
+        await this.sendQQCard(chatId, sender, {
+          markdown: getQQHelpMarkdown(),
+          qqText: getQQHelpText(),
+        });
+        break;
+
+      case 'status': {
+        const sessionId = chatSessionStore.getSessionIdByConversation('qq', chatId);
+        const status = sessionId
+          ? `当前绑定会话: ${sessionId}`
+          : '未绑定会话';
+        await sender.sendText(chatId, `OpenCode 状态\n\n${status}`);
+        break;
+      }
+
+      case 'session':
+      case 'sessions':
+        await this.handleSessionCommand(command, chatId, senderId, sender);
+        break;
+
+      case 'config':
+        await this.handleConfigCommand(command, chatId, sender);
+        break;
+
+      case 'model':
+        await this.handleModelCommand(command, chatId, senderId, sender);
+        break;
+
+      case 'models':
+        await this.handleModelsCommand(chatId, sender);
+        break;
+
+      case 'agent':
+        await this.handleAgentCommand(command, chatId, senderId, sender);
+        break;
+
+      case 'agents':
+        await this.handleAgentsCommand(chatId, sender);
+        break;
+
+      case 'clear':
+        await this.handleClearCommand(chatId, senderId, sender);
+        break;
+
+      case 'stop': {
+        const sessionId = chatSessionStore.getSessionIdByConversation('qq', chatId);
+        if (sessionId) {
+          await opencodeClient.abortSession(sessionId);
+          await sender.sendText(chatId, '已发送中断请求');
+        } else {
+          await sender.sendText(chatId, '当前没有活跃的会话');
+        }
+        break;
+      }
+
+      default:
+        // 其他命令暂不支持
+        await sender.sendText(chatId, `命令 "${command.type}" 暂不支持，/help 查看可用命令`);
+    }
+  }
+
+  /**
+   * 处理 session 命令
+   */
+  private async handleSessionCommand(
+    command: ParsedCommand,
+    chatId: string,
+    senderId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    if (command.sessionAction === 'new') {
+      // 创建新会话
+      const title = `QQ会话-${buildSessionTimestamp()}`;
+      const chatDefault = chatSessionStore.getSessionByConversation('qq', chatId)?.defaultDirectory;
+      const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
+      const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
+
+      try {
+        const session = await opencodeClient.createSession(title, effectiveDir);
+        if (session) {
+          chatSessionStore.setSessionByConversation('qq', chatId, session.id, senderId, title, {
+            chatType: 'p2p',
+            resolvedDirectory: session.directory,
+          });
+          const dirInfo = session.directory ? `\n工作目录: ${session.directory}` : '';
+          await sender.sendText(chatId, `已创建新会话窗口\nID: ${session.id}${dirInfo}`);
+        } else {
+          await sender.sendText(chatId, '创建会话失败');
+        }
+      } catch (error) {
+        console.error('[QQ] 创建会话失败:', error);
+        await sender.sendText(chatId, '创建会话失败，请稍后重试');
+      }
+    } else if (command.sessionAction === 'switch' && command.sessionId) {
+      // 切换到指定会话
+      try {
+        const session = await opencodeClient.findSessionAcrossProjects(command.sessionId);
+        if (session) {
+          chatSessionStore.setSessionByConversation('qq', chatId, session.id, senderId, session.title || '未命名会话', {
+            chatType: 'p2p',
+            resolvedDirectory: session.directory,
+          });
+          await sender.sendText(chatId, `已切换到会话: ${session.id}`);
+        } else {
+          await sender.sendText(chatId, `未找到会话: ${command.sessionId}`);
+        }
+      } catch (error) {
+        console.error('[QQ] 切换会话失败:', error);
+        await sender.sendText(chatId, '切换会话失败');
+      }
+    } else {
+      // 列出会话
+      await this.handleListSessions(chatId, command.listAll ?? false, sender);
+    }
+  }
+
+  /**
+   * 列出会话
+   */
+  private async handleListSessions(
+    chatId: string,
+    listAll: boolean,
+    sender: PlatformSender
+  ): Promise<void> {
+    try {
+      const sessions = listAll
+        ? await opencodeClient.listSessionsAcrossProjects()
+        : await opencodeClient.listSessions();
+
+      if (sessions.length === 0) {
+        await sender.sendText(chatId, '暂无会话');
+        return;
+      }
+
+      const sortedSessions = await this.sortSessions(chatId, sessions);
+      const mode = this.getSessionOrderMode(chatId);
+
+      const introMarkdownLines: string[] = [
+        `# 会话列表`,
+        ``,
+        `当前排序：**${this.formatSessionOrderMode(mode)}**`,
+        listAll ? `范围：**全部项目**` : `范围：**当前项目**`,
+        ``,
+        `使用 ${buildQQCmdInput('/session ', '/session <session id>')} 切换会话`,
+        ``,
+      ];
+      const introTextLines: string[] = [
+        '会话列表:',
+        `当前排序: ${this.formatSessionOrderMode(mode)}`,
+        `范围: ${listAll ? '全部项目' : '当前项目'}`,
+        '使用 /session <session id> 切换会话',
+        '',
+      ];
+      const sections: Array<{ markdown: string; text: string }> = [];
+
+      for (const session of sortedSessions) {
+        const title = session.title || '未命名';
+        const shortId = session.id.slice(0, 8);
+        sections.push({
+          markdown: `- ${buildQQCmdInput(session.id, `${shortId}: ${title}`)}`,
+          text: `- ${shortId}: ${title}`,
+        });
+      }
+
+      sections.push({
+        markdown: `共 ${sortedSessions.length} 个会话`,
+        text: `共 ${sortedSessions.length} 个会话`,
+      });
+
+      if (!listAll) {
+        sections.push({
+          markdown: `提示：使用 ${buildQQCmdInput('/sessions all')} 查看所有项目会话`,
+          text: '提示: 使用 /sessions all 查看所有项目会话',
+        });
+      }
+
+      await this.sendQQPagedCard(chatId, sender, introMarkdownLines, introTextLines, sections);
+    } catch (error) {
+      console.error('[QQ] 获取会话列表失败:', error);
+      await sender.sendText(chatId, '获取会话列表失败');
+    }
+  }
+
+  /**
+   * 处理 model 命令
+   */
+  private async handleModelCommand(
+    command: ParsedCommand,
+    chatId: string,
+    _senderId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    const session = chatSessionStore.getSessionByConversation('qq', chatId);
+
+    if (!command.modelName) {
+      // 显示当前模型
+      const envDefaultModel = modelConfig.defaultProvider && modelConfig.defaultModel
+        ? `${modelConfig.defaultProvider}:${modelConfig.defaultModel}`
+        : undefined;
+      const currentModel = session?.preferredModel || envDefaultModel || '跟随 OpenCode 默认模型';
+      await sender.sendText(chatId, `当前模型: ${currentModel}`);
+      return;
+    }
+
+    // 设置模型
+    const normalizedModelName = command.modelName.trim();
+
+    // 验证模型是否存在
+    try {
+      const providersResult = await opencodeClient.getProviders();
+      const providers = Array.isArray(providersResult.providers) ? providersResult.providers : [];
+
+      const matchedModel = findAllowedChatModel(providers, normalizedModelName);
+
+      if (matchedModel) {
+        chatSessionStore.updateConfigByConversation('qq', chatId, {
+          preferredModel: `${matchedModel.providerId}:${matchedModel.modelId}`,
+        });
+        await sender.sendText(chatId, `已切换模型: ${matchedModel.providerId}:${matchedModel.modelId}`);
+      } else if (normalizedModelName.includes(':') || normalizedModelName.includes('/')) {
+        const parsedModel = parseChatModelReference(normalizedModelName);
+        if (!parsedModel) {
+          await sender.sendText(chatId, `未找到模型 "${normalizedModelName}"`);
+          return;
+        }
+        if (!isChatModelAllowed(parsedModel.providerId, parsedModel.modelId)) {
+          await sender.sendText(chatId, `模型 "${normalizedModelName}" 不在当前允许列表中`);
+          return;
+        }
+
+        chatSessionStore.updateConfigByConversation('qq', chatId, {
+          preferredModel: `${parsedModel.providerId}:${parsedModel.modelId}`,
+        });
+        await sender.sendText(chatId, `已设置模型: ${parsedModel.providerId}:${parsedModel.modelId}`);
+      } else {
+        await sender.sendText(chatId, `未找到模型 "${normalizedModelName}"`);
+      }
+    } catch (error) {
+      console.error('[QQ] 设置模型失败:', error);
+      await sender.sendText(chatId, `设置模型失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * 列出所有可用模型
+   */
+  private async handleModelsCommand(chatId: string, sender: PlatformSender): Promise<void> {
+    try {
+      const providersResult = await opencodeClient.getProviders();
+      const providers = Array.isArray(providersResult?.providers) ? providersResult.providers : [];
+
+      if (providers.length === 0) {
+        console.warn('[QQ] No providers found in getProviders result');
+        await sender.sendText(chatId, '❌ 未找到可用的模型提供商，请检查 OpenCode 配置');
+        return;
+      }
+
+      const models = collectAllowedChatModels(providers);
+      const providerGroups = new Map<string, { providerName: string; models: Array<{ id: string; name: string }> }>();
+
+      for (const model of models) {
+        if (!providerGroups.has(model.providerId)) {
+          providerGroups.set(model.providerId, {
+            providerName: model.providerName,
+            models: [],
+          });
+        }
+        providerGroups.get(model.providerId)!.models.push({ id: model.modelId, name: model.modelName });
+      }
+
+      const introMarkdownLines: string[] = [
+        '# 可用模型列表',
+        '',
+        `使用 ${buildQQCmdInput('/model ', '/model <名称>')} 切换模型`,
+        '',
+      ];
+      const introTextLines: string[] = [
+        '可用模型列表',
+        '使用 /model <名称> 切换模型',
+        '',
+      ];
+      const sections: Array<{ markdown: string; text: string }> = [];
+      let totalCount = 0;
+
+      for (const [providerId, group] of providerGroups.entries()) {
+        if (group.models.length === 0) continue;
+
+        const providerMarkdownLines: string[] = [`## ${group.providerName}`];
+        const providerTextLines: string[] = [`【${group.providerName}】`];
+
+        for (const model of group.models.slice(0, 10)) {
+          const modelDisplay = model.name || model.id;
+          const modelKey = `${providerId}:${model.id}`;
+          providerMarkdownLines.push(`- ${buildQQCmdInput(modelKey, `${modelDisplay} (${modelKey})`)}`);
+          providerTextLines.push(`- ${modelDisplay} (${modelKey})`);
+          totalCount++;
+        }
+
+        if (group.models.length > 10) {
+          providerMarkdownLines.push(`- _... 共 ${group.models.length} 个模型_`);
+          providerTextLines.push(`- ... 共 ${group.models.length} 个模型`);
+        }
+
+        sections.push({
+          markdown: providerMarkdownLines.join('\n'),
+          text: providerTextLines.join('\n'),
+        });
+      }
+
+      if (totalCount === 0) {
+        await sender.sendText(chatId, '暂无可用模型');
+        return;
+      }
+
+      sections.push({
+        markdown: `共 ${totalCount} 个模型，点击条目可自动填入模型 ID。`,
+        text: `共 ${totalCount} 个模型，使用 /model <名称> 切换`,
+      });
+
+      await this.sendQQPagedCard(chatId, sender, introMarkdownLines, introTextLines, sections);
+    } catch (error) {
+      console.error('[QQ] 获取模型列表失败:', error);
+      await sender.sendText(chatId, '获取模型列表失败');
+    }
+  }
+
+  private async handleConfigCommand(
+    command: ParsedCommand,
+    chatId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    if (!command.configKey) {
+      await this.sendQQCard(chatId, sender, {
+        markdown: [
+          '# 当前聊天配置',
+          '',
+          '- `/config session order` 查看当前会话排序模式',
+          '- `/config session order default` 使用默认排序',
+          '- `/config session order last_time` 按最后修改时间倒序',
+          '- `/config output onlyText true|false` 切换 QQ Markdown / 纯文本输出',
+          '- `/config session help_with_qc true|false` 控制 /help 后是否推送 /qc',
+          '- `/config session session_with_ctl true|false` 控制 /sessions 后是否推送 /session_ctl',
+          '- `/config session session_with_change true|false` 控制 /sessions 是否展示会话切换按钮',
+        ].join('\n'),
+        qqText: [
+          '当前聊天配置',
+          '/config session order - 查看当前会话排序模式',
+          '/config session order default - 使用默认排序',
+          '/config session order last_time - 按最后修改时间倒序',
+          '/config output onlyText true|false - 切换 QQ Markdown / 纯文本输出',
+          '/config session help_with_qc true|false - 控制 /help 后是否推送 /qc',
+          '/config session session_with_ctl true|false - 控制 /sessions 后是否推送 /session_ctl',
+          '/config session session_with_change true|false - 控制 /sessions 是否展示会话切换按钮',
+        ].join('\n'),
+      });
+      return;
+    }
+
+    if (command.configScope === 'output' && command.configKey === 'only_text') {
+      const currentValue = this.isQQOnlyTextEnabled(chatId);
+
+      if (!command.configValue) {
+        await this.sendQQCard(chatId, sender, {
+          markdown: [
+            '# QQ 输出配置',
+            '',
+            `当前模式：**${currentValue ? '纯文本输出' : 'Markdown 输出'}**`,
+            '',
+            '- `true`：禁用 QQ Markdown，直接输出原始文本',
+            '- `false`：恢复 QQ Markdown 输出',
+            '',
+            '说明：当前版本电脑 QQ 的 Markdown 渲染可能不稳定，若出现内容被吞或显示异常，可切换到纯文本输出。',
+          ].join('\n'),
+          qqText: [
+            'QQ 输出配置',
+            `当前模式: ${currentValue ? '纯文本输出' : 'Markdown 输出'}`,
+            '- true: 禁用 QQ Markdown，直接输出原始文本',
+            '- false: 恢复 QQ Markdown 输出',
+            '说明: 当前版本电脑 QQ 的 Markdown 渲染可能不稳定，若出现内容被吞或显示异常，可切换到纯文本输出。',
+          ].join('\n'),
+        });
+        return;
+      }
+
+      if (command.configValue !== 'true' && command.configValue !== 'false') {
+        await sender.sendText(chatId, '配置 onlyText 仅支持 true 或 false。');
+        return;
+      }
+
+      const boolValue = command.configValue === 'true';
+      chatSessionStore.updateConfigByConversation('qq', chatId, {
+        qqOutputOnlyText: boolValue,
+      });
+      await sender.sendText(chatId, `QQ 输出模式已切换为：${boolValue ? '纯文本输出' : 'Markdown 输出'}`);
+      return;
+    }
+
+    if (command.configScope !== 'session') {
+      await sender.sendText(chatId, '当前仅支持 /config session 与 /config output onlyText 配置');
+      return;
+    }
+
+    if (command.configKey === 'order') {
+      if (!command.configValue) {
+        const mode = this.getSessionOrderMode(chatId);
+        await this.sendQQCard(chatId, sender, {
+          markdown: [
+            '# 会话排序配置',
+            '',
+            `当前模式：**${this.formatSessionOrderMode(mode)}**`,
+            '',
+            '可选值：',
+            '- `default` 默认排序',
+            '- `last_time` 按最后修改时间倒序',
+          ].join('\n'),
+          qqText: [
+            '会话排序配置',
+            `当前模式: ${this.formatSessionOrderMode(mode)}`,
+            '可选值:',
+            '- default 默认排序',
+            '- last_time 按最后修改时间倒序',
+          ].join('\n'),
+        });
+        return;
+      }
+
+      if (command.configValue !== 'default' && command.configValue !== 'last_time') {
+        await sender.sendText(chatId, '不支持的排序模式。请使用 /config session order default 或 /config session order last_time。');
+        return;
+      }
+
+      chatSessionStore.updateConfigByConversation('qq', chatId, {
+        sessionOrderMode: command.configValue,
+      });
+      await sender.sendText(chatId, `当前模式已切换为：${this.formatSessionOrderMode(command.configValue)}`);
+      return;
+    }
+
+    if (
+      command.configKey === 'help_with_qc'
+      || command.configKey === 'session_with_ctl'
+      || command.configKey === 'session_with_change'
+    ) {
+      const currentValue = command.configKey === 'help_with_qc'
+        ? chatSessionStore.getSessionByConversation('qq', chatId)?.helpWithQc === true
+        : command.configKey === 'session_with_ctl'
+          ? chatSessionStore.getSessionByConversation('qq', chatId)?.sessionWithCtl === true
+          : chatSessionStore.getSessionByConversation('qq', chatId)?.sessionWithChange === true;
+
+      if (!command.configValue) {
+        await sender.sendText(chatId, `${command.configKey} 当前值: ${currentValue ? 'true' : 'false'}`);
+        return;
+      }
+
+      if (command.configValue !== 'true' && command.configValue !== 'false') {
+        await sender.sendText(chatId, `配置 ${command.configKey} 仅支持 true 或 false`);
+        return;
+      }
+
+      const boolValue = command.configValue === 'true';
+      if (command.configKey === 'help_with_qc') {
+        chatSessionStore.updateConfigByConversation('qq', chatId, { helpWithQc: boolValue });
+      } else if (command.configKey === 'session_with_ctl') {
+        chatSessionStore.updateConfigByConversation('qq', chatId, { sessionWithCtl: boolValue });
+      } else {
+        chatSessionStore.updateConfigByConversation('qq', chatId, { sessionWithChange: boolValue });
+      }
+
+      await sender.sendText(chatId, `已将 ${command.configKey} 设置为 ${String(boolValue)}`);
+      return;
+    }
+
+    await sender.sendText(chatId, '当前仅支持 /config session 下的会话排序与展示配置，以及 /config output onlyText');
+  }
+
+  /**
+   * 处理 agent 命令
+   */
+  private async handleAgentCommand(
+    command: ParsedCommand,
+    chatId: string,
+    _senderId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    const session = chatSessionStore.getSessionByConversation('qq', chatId);
+
+    if (!command.agentName) {
+      // 显示当前角色
+      const currentAgent = session?.preferredAgent || '默认角色';
+      await sender.sendText(chatId, `当前角色: ${currentAgent}`);
+      return;
+    }
+
+    // 设置角色
+    const normalizedAgentName = command.agentName.trim().toLowerCase();
+
+    if (normalizedAgentName === 'off' || normalizedAgentName === 'default') {
+      chatSessionStore.updateConfigByConversation('qq', chatId, { preferredAgent: undefined });
+      await sender.sendText(chatId, '已切换为默认角色');
+      return;
+    }
+
+    chatSessionStore.updateConfigByConversation('qq', chatId, { preferredAgent: command.agentName.trim() });
+    await sender.sendText(chatId, `已切换角色: ${command.agentName.trim()}`);
+  }
+
+  /**
+   * 列出所有可用角色
+   */
+  private async handleAgentsCommand(chatId: string, sender: PlatformSender): Promise<void> {
+    try {
+      const agents = await opencodeClient.getAgents();
+      const visibleAgents = agents.filter((a: { name: string }) =>
+        a.name && !['compaction', 'title', 'summary'].includes(a.name)
+      );
+
+      if (visibleAgents.length === 0) {
+        await sender.sendText(chatId, '暂无可用角色');
+        return;
+      }
+
+      const lines: string[] = ['📋 可用角色列表\n'];
+
+      for (const agent of visibleAgents) {
+        const desc = agent.description ? ` - ${agent.description.slice(0, 50)}${agent.description.length > 50 ? '...' : ''}` : '';
+        lines.push(`• ${agent.name}${desc}`);
+      }
+
+      lines.push(`\n共 ${visibleAgents.length} 个角色，使用 /agent <名称> 切换`);
+
+      await sender.sendText(chatId, lines.join('\n'));
+    } catch (error) {
+      console.error('[QQ] 获取角色列表失败:', error);
+      await sender.sendText(chatId, '获取角色列表失败');
+    }
+  }
+
+  /**
+   * 处理 clear 命令
+   */
+  private async handleClearCommand(
+    chatId: string,
+    senderId: string,
+    sender: PlatformSender
+  ): Promise<void> {
+    const session = chatSessionStore.getSessionByConversation('qq', chatId);
+
+    if (session?.sessionId) {
+      await opencodeClient.deleteSession(session.sessionId);
+      chatSessionStore.removeSessionByConversation('qq', chatId);
+      await sender.sendText(chatId, '会话上下文已清除，新消息将开启新会话。');
+    } else {
+      // 创建新会话
+      const title = `QQ会话-${buildSessionTimestamp()}`;
+      const dirResult = DirectoryPolicy.resolve({});
+      const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
+
+      try {
+        const newSession = await opencodeClient.createSession(title, effectiveDir);
+        if (newSession) {
+          chatSessionStore.setSessionByConversation('qq', chatId, newSession.id, senderId, title, {
+            chatType: 'p2p',
+            resolvedDirectory: newSession.directory,
+          });
+          await sender.sendText(chatId, '已创建新会话');
+        }
+      } catch (error) {
+        console.error('[QQ] 创建会话失败:', error);
+        await sender.sendText(chatId, '创建新会话失败');
+      }
+    }
+  }
+
+  /**
+   * 处理 QQ 消息
+   */
+  async handleMessage(
+    event: PlatformMessageEvent,
+    sender: PlatformSender
+  ): Promise<void> {
+    // 群聊 @ 提到检查
+    if (shouldSkipGroupMessage(event)) {
+      return;
+    }
+
+    const { conversationId: chatId, content, senderId, attachments } = event;
+    const trimmed = content.trim();
+
+    // 0. 优先检查待处理的权限请求
+    if (trimmed && !trimmed.startsWith('/')) {
+      const handled = await this.tryHandlePendingPermission(chatId, trimmed, sender);
+      if (handled) return;
+    }
+
+    // 0.5 检查待回答的问题
+    if (trimmed && !trimmed.startsWith('/')) {
+      const handled = await this.tryHandlePendingQuestion(chatId, trimmed, sender);
+      if (handled) return;
+    }
+
+    // 1. 处理命令
+    const command = parseCommand(trimmed);
+    if (command.type !== 'prompt') {
+      console.log(`[QQ] 收到命令：${command.type}`);
+      await this.handleCommand(command, chatId, senderId, sender);
+      return;
+    }
+
+    // 2. 获取或创建会话
+    let sessionId = chatSessionStore.getSessionIdByConversation('qq', chatId);
+    if (!sessionId) {
+      const title = `QQ会话-${buildSessionTimestamp()}`;
+      const chatDefault = chatSessionStore.getSessionByConversation('qq', chatId)?.defaultDirectory;
+      const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
+      const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
+      const session = await opencodeClient.createSession(title, effectiveDir);
+      if (session) {
+        sessionId = session.id;
+        chatSessionStore.setSessionByConversation('qq', chatId, sessionId, senderId, title, {
+          chatType: event.chatType || 'p2p',
+          resolvedDirectory: session.directory,
+        });
+      } else {
+        await sender.sendText(chatId, '无法创建 OpenCode 会话');
+        return;
+      }
+    }
+
+    // 3. 处理 Prompt
+    const sessionConfig = chatSessionStore.getSessionByConversation('qq', chatId);
+    const promptText = command.text ?? trimmed;
+    await this.processPrompt(
+      sessionId,
+      promptText,
+      chatId,
+      attachments,
+      sessionConfig,
+      command.promptEffort,
+      sender
+    );
+  }
+
+  /**
+   * 处理动作事件
+   */
+  async handleAction(
+    event: { action: { tag: string; value: Record<string, unknown> }; senderId: string; conversationId?: string; messageId?: string },
+    sender: PlatformSender
+  ): Promise<void> {
+    const { action, conversationId } = event;
+    if (!conversationId) return;
+
+    console.log(`[QQ] 收到动作：${action.tag}`);
+
+    if (action.tag === 'allow') {
+      await sender.sendText(conversationId, '已允许该操作');
+    } else if (action.tag === 'deny') {
+      await sender.sendText(conversationId, '已拒绝该操作');
+    }
+  }
+
+  /**
+   * 处理消息发送
+   */
+  private async processPrompt(
+    sessionId: string,
+    text: string,
+    chatId: string,
+    attachments: PlatformMessageEvent['attachments'],
+    config?: { preferredModel?: string; preferredAgent?: string; preferredEffort?: EffortLevel },
+    promptEffort?: EffortLevel,
+    sender?: PlatformSender
+  ): Promise<void> {
+    const bufferKey = `chat:qq:${chatId}`;
+    this.ensureStreamingBuffer(chatId, sessionId);
+
+    if (!sender) {
+      console.error('[QQ] 发送器为空，无法发送消息');
+      return;
+    }
+
+    try {
+      console.log(`[QQ] 发送消息：chat=${chatId}, session=${sessionId.slice(0, 8)}...`);
+
+      const parts: OpencodePartInput[] = [];
+
+      if (text) {
+        parts.push({ type: 'text', text });
+      }
+
+      if (attachments && attachments.length > 0) {
+        const prepared = await this.prepareAttachmentParts(attachments);
+        if (prepared.warnings.length > 0) {
+          await sender.sendText(chatId, `附件警告:\n${prepared.warnings.join('\n')}`);
+        }
+        parts.push(...prepared.parts);
+      }
+
+      if (parts.length === 0) {
+        await sender.sendText(chatId, '未检测到有效内容');
+        outputBuffer.setStatus(bufferKey, 'completed');
+        return;
+      }
+
+      let providerId: string | undefined;
+      let modelId: string | undefined;
+
+      if (modelConfig.defaultProvider && modelConfig.defaultModel) {
+        providerId = modelConfig.defaultProvider;
+        modelId = modelConfig.defaultModel;
+      }
+
+      if (config?.preferredModel) {
+        const [p, m] = config.preferredModel.split(':');
+        if (p && m) {
+          providerId = p;
+          modelId = m;
+        } else {
+          if (providerId) {
+            modelId = config.preferredModel;
+          }
+        }
+      }
+
+      const sessionData = chatSessionStore.getSessionByConversation('qq', chatId);
+      const directory = sessionData?.resolvedDirectory;
+
+      let variant = promptEffort || config?.preferredEffort;
+
+      // 验证 variant 是否与当前模型兼容
+      if (variant && providerId && modelId) {
+        try {
+          const providersPayload = await opencodeClient.getProviders();
+          const providers = Array.isArray(providersPayload.providers) ? providersPayload.providers : [];
+          const providerLower = providerId.toLowerCase();
+          const modelLower = modelId.toLowerCase();
+
+          for (const provider of providers) {
+            if (!provider || typeof provider !== 'object') continue;
+            const providerRecord = provider as Record<string, unknown>;
+            const providerIdRaw = typeof providerRecord.id === 'string' ? providerRecord.id.trim() : '';
+            if (!providerIdRaw || providerIdRaw.toLowerCase() !== providerLower) continue;
+
+            const modelsRaw = providerRecord.models;
+            const modelList = Array.isArray(modelsRaw)
+              ? modelsRaw
+              : (modelsRaw && typeof modelsRaw === 'object' ? Object.values(modelsRaw) : []);
+
+            for (const modelItem of modelList) {
+              if (!modelItem || typeof modelItem !== 'object') continue;
+              const modelRecord = modelItem as Record<string, unknown>;
+              const modelIdRaw = typeof modelRecord.id === 'string'
+                ? modelRecord.id.trim()
+                : (typeof modelRecord.modelID === 'string' ? modelRecord.modelID.trim() : '');
+              if (!modelIdRaw || modelIdRaw.toLowerCase() !== modelLower) continue;
+
+              // 解析模型支持的 variants
+              const variants = modelRecord.variants;
+              if (variants && typeof variants === 'object' && !Array.isArray(variants)) {
+                const supportedVariants: EffortLevel[] = [];
+                for (const key of Object.keys(variants as Record<string, unknown>)) {
+                  const normalized = normalizeEffortLevel(key);
+                  if (normalized && normalized !== 'none' && !supportedVariants.includes(normalized)) {
+                    supportedVariants.push(normalized);
+                  }
+                }
+                // 如果当前 variant 不在支持列表中，清除它
+                if (supportedVariants.length > 0 && !supportedVariants.includes(variant)) {
+                  variant = undefined;
+                }
+              }
+              break;
+            }
+            break;
+          }
+        } catch (error) {
+          console.debug('[QQ] 获取模型支持的 variants 失败，跳过验证:', error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      // ── 非多模态主模型图片回退 ──
+      const dispatchParts = await preprocessVisionParts(
+        parts as VisionPart[],
+        { providerId, modelId, directory },
+        'QQ',
+      ) as OpencodePartInput[];
+
+      await opencodeClient.sendMessagePartsAsync(
+        sessionId,
+        dispatchParts,
+        {
+          providerId,
+          modelId,
+          agent: config?.preferredAgent,
+          ...(variant ? { variant } : {}),
+          ...(directory ? { directory } : {}),
+        }
+      );
+
+    } catch (error) {
+      const errorMessage = this.formatDispatchError(error);
+      console.error('[QQ] 请求派发失败:', error);
+
+      outputBuffer.append(bufferKey, `\n\n错误：${errorMessage}`);
+      outputBuffer.setStatus(bufferKey, 'failed');
+
+      const currentBuffer = outputBuffer.get(bufferKey);
+      if (!currentBuffer?.messageId) {
+        await sender.sendText(chatId, `错误：${errorMessage}`);
+      }
+    }
+  }
+
+  /**
+   * 处理附件下载和转换
+   * 支持 OneBot 和 QQ 官方 API 的附件格式
+   */
+  private async prepareAttachmentParts(
+    attachments: PlatformMessageEvent['attachments']
+  ): Promise<{ parts: OpencodeFilePartInput[]; warnings: string[] }> {
+    const parts: OpencodeFilePartInput[] = [];
+    const warnings: string[] = [];
+
+    await fs.mkdir(ATTACHMENT_BASE_DIR, { recursive: true }).catch(() => undefined);
+
+    if (!attachments) {
+      return { parts, warnings };
+    }
+
+    for (const attachment of attachments) {
+      try {
+        // 检查文件大小
+        if (attachment.fileSize && attachment.fileSize > attachmentConfig.maxSize) {
+          warnings.push(`附件 ${attachment.fileName || '未知'} 过大 (${Math.round(attachment.fileSize / 1024 / 1024)}MB)，已跳过`);
+          continue;
+        }
+
+        const fileKey = attachment.fileKey;
+        if (!fileKey) {
+          warnings.push(`附件 ${attachment.fileName || '未知'} 缺少文件 URL`);
+          continue;
+        }
+
+        console.log(`[QQ] 下载附件: ${attachment.fileName || fileKey.slice(0, 50)}`);
+
+        // 下载文件
+        const response = await axios({
+          method: 'GET',
+          url: fileKey,
+          responseType: 'arraybuffer',
+          timeout: 60000,
+          maxContentLength: attachmentConfig.maxSize,
+        });
+
+        const buffer = Buffer.from(response.data);
+        const contentType = (response.headers['content-type'] as string) || '';
+
+        // 确定文件扩展名
+        const extFromName = attachment.fileName ? extractExtension(attachment.fileName) : '';
+        const extFromType = attachment.fileType ? normalizeExtension(attachment.fileType) : '';
+        const extFromContent = contentType ? extensionFromContentType(contentType) : '';
+        let ext = normalizeExtension(extFromName || extFromType || extFromContent);
+
+        // 图片默认扩展名
+        if (!ext && attachment.type === 'image') {
+          ext = '.jpg';
+        }
+
+        // 检查扩展名是否支持
+        if (!ext || !ALLOWED_ATTACHMENT_EXTENSIONS.has(ext)) {
+          console.log(`[QQ] 不支持的附件格式: ext=${ext || 'unknown'}, contentType=${contentType}`);
+          warnings.push(`附件格式不支持 (${ext || 'unknown'})，已跳过`);
+          continue;
+        }
+
+        // 生成文件名
+        const fileId = randomUUID();
+        const rawName = attachment.fileName || `attachment${ext}`;
+        const safeName = sanitizeFilename(rawName.endsWith(ext) ? rawName : `${rawName}${ext}`);
+        const filePath = path.join(ATTACHMENT_BASE_DIR, `${fileId}${ext}`);
+
+        try {
+          // 写入临时文件
+          await fs.writeFile(filePath, buffer);
+
+          // 转换为 base64 data URL
+          const base64 = buffer.toString('base64');
+          let mime = contentType ? contentType.split(';')[0].trim() : '';
+          if (!mime || mime === 'application/octet-stream') {
+            mime = mimeFromExtension(ext);
+          }
+
+          const dataUrl = `data:${mime};base64,${base64}`;
+
+          parts.push({
+            type: 'file',
+            mime,
+            url: dataUrl,
+            filename: safeName,
+          });
+
+          console.log(`[QQ] 附件处理成功: ${safeName}, mime=${mime}`);
+        } finally {
+          // 清理临时文件
+          fs.unlink(filePath).catch(() => {});
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[QQ] 附件下载失败: ${attachment.fileName || '未知'} - ${errorMsg}`);
+        warnings.push(`附件 ${attachment.fileName || '未知'} 下载失败: ${errorMsg}`);
+      }
+    }
+
+    return { parts, warnings };
+  }
+}
+
+export const qqHandler = new QQHandler();

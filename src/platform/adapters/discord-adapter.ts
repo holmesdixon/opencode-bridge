@@ -1,4 +1,4 @@
-import {
+import type {
   ActionRowBuilder,
   ChannelType,
   Client,
@@ -7,8 +7,8 @@ import {
   Partials,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
-  type Interaction,
-  type Message,
+  Interaction,
+  Message,
 } from 'discord.js';
 import type {
   PlatformActionEvent,
@@ -21,63 +21,19 @@ import { discordConfig } from '../../config.js';
 import { opencodeClient } from '../../opencode/client.js';
 import { chatSessionStore } from '../../store/chat-session.js';
 import { reliabilityConfig } from '../../config.js';
-import { getRuntimeCronManager } from '../../reliability/runtime-cron-registry.js';
-import { cleanupRuntimeCronJobsByConversation } from '../../reliability/runtime-cron-orphan.js';
+import { getRuntimeCronManager, cleanupRuntimeCronJobsByConversation } from '../../reliability/runtime-cron.js';
 
-const DISCORD_MESSAGE_LIMIT = 1800;
+import {
+  DISCORD_MESSAGE_LIMIT,
+  type DiscordSelectOptionPayload,
+  type DiscordSelectComponentPayload,
+  type DiscordCardPayload,
+  type DiscordMessagePayload,
+  type DiscordSendableChannel,
+} from './discord-adapter-types.js';
 
-type DiscordSelectOptionPayload = {
-  label: string;
-  value: string;
-  description?: string;
-  emoji?: string;
-};
+import { getDiscordModule, escapeRegExp, isDiscordSendableChannel } from './discord-adapter-utils.js';
 
-type DiscordSelectComponentPayload = {
-  type?: 'select';
-  customId: string;
-  placeholder?: string;
-  options: DiscordSelectOptionPayload[];
-  minValues?: number;
-  maxValues?: number;
-  disabled?: boolean;
-};
-
-type DiscordCardPayload = {
-  discordText?: string;
-  discordComponents?: DiscordSelectComponentPayload[];
-};
-
-type DiscordMessagePayload = {
-  content: string;
-  components?: ActionRowBuilder<StringSelectMenuBuilder>[];
-};
-
-type DiscordSendableChannel = {
-  send: (content: string | DiscordMessagePayload) => Promise<Message>;
-  messages: {
-    fetch: (messageId: string) => Promise<Message>;
-  };
-};
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function isDiscordSendableChannel(channel: unknown): channel is DiscordSendableChannel {
-  if (!channel || typeof channel !== 'object') {
-    return false;
-  }
-
-  const record = channel as {
-    send?: unknown;
-    messages?: { fetch?: unknown };
-  };
-
-  return typeof record.send === 'function'
-    && !!record.messages
-    && typeof record.messages.fetch === 'function';
-}
 
 class DiscordSender implements PlatformSender {
   constructor(private readonly adapter: DiscordAdapter) {}
@@ -105,7 +61,7 @@ class DiscordSender implements PlatformSender {
     return chunks;
   }
 
-  private normalizeCardPayload(card: object): DiscordMessagePayload {
+  private async normalizeCardPayload(card: object): Promise<DiscordMessagePayload> {
     const payload = card as DiscordCardPayload;
 
     const content = (() => {
@@ -119,7 +75,7 @@ class DiscordSender implements PlatformSender {
       return `\`\`\`json\n${clipped}\n\`\`\``;
     })();
 
-    const rows = this.buildSelectComponents(payload.discordComponents);
+    const rows = await this.buildSelectComponents(payload.discordComponents);
     if (rows.length === 0) {
       return { content };
     }
@@ -130,12 +86,15 @@ class DiscordSender implements PlatformSender {
     };
   }
 
-  private buildSelectComponents(
+  private async buildSelectComponents(
     components?: DiscordSelectComponentPayload[]
-  ): ActionRowBuilder<StringSelectMenuBuilder>[] {
+  ): Promise<ActionRowBuilder<StringSelectMenuBuilder>[]> {
     if (!Array.isArray(components) || components.length === 0) {
       return [];
     }
+
+    // 动态获取 discord.js 类
+    const { ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = await getDiscordModule();
 
     const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
     for (const component of components.slice(0, 5)) {
@@ -205,7 +164,7 @@ class DiscordSender implements PlatformSender {
       return null;
     }
 
-    const payload = this.normalizeCardPayload(card);
+    const payload = await this.normalizeCardPayload(card);
     const sent = await channel.send(payload);
     this.adapter.rememberMessageConversation(sent.id, conversationId);
     return sent.id;
@@ -222,7 +181,7 @@ class DiscordSender implements PlatformSender {
       return false;
     }
 
-    await message.edit(this.normalizeCardPayload(card));
+    await message.edit(await this.normalizeCardPayload(card));
     return true;
   }
 
@@ -303,7 +262,7 @@ class DiscordSender implements PlatformSender {
     }
 
     try {
-      const sent = await message.reply(this.normalizeCardPayload(card));
+      const sent = await message.reply(await this.normalizeCardPayload(card));
       this.adapter.rememberMessageConversation(sent.id, conversationId);
       return sent.id;
     } catch (error) {
@@ -336,8 +295,8 @@ export class DiscordAdapter implements PlatformAdapter {
     }
 
     if (!discordConfig.token) {
-      console.warn('[Discord] ⚠️ 已启用但缺少 DISCORD_TOKEN（或 DISCORD_BOT_TOKEN），适配器将保持不活跃状态');
-      console.warn('[Discord] 请设置 DISCORD_TOKEN 或 DISCORD_BOT_TOKEN 后重启服务');
+      console.warn('[Discord] ⚠️ 已启用但缺少 DISCORD_TOKEN，适配器将保持不活跃状态');
+      console.warn('[Discord] 请设置 DISCORD_TOKEN 后重启服务');
       return;
     }
 
@@ -349,6 +308,11 @@ export class DiscordAdapter implements PlatformAdapter {
       console.warn('[Discord] 适配器已存在客户端实例，跳过重复启动');
       return;
     }
+
+    // 动态导入 discord.js（节省内存，未启用时不加载）
+    console.log('[Discord] 动态加载 discord.js SDK...');
+    const discord = await getDiscordModule();
+    const { Client, GatewayIntentBits, Partials, Events } = discord;
 
     const client = new Client({
       intents: [
@@ -428,13 +392,16 @@ export class DiscordAdapter implements PlatformAdapter {
   }
 
   stop(): void {
-    if (!this.client) {
-      return;
+    if (this.client) {
+      this.client.destroy();
+      this.client = null;
     }
-    this.client.destroy();
-    this.client = null;
     this.isActive = false;
     this.messageConversationMap.clear();
+    this.messageCallbacks.length = 0;
+    this.interactionCallbacks.length = 0;
+    this.actionCallbacks.length = 0;
+    this.messageRecalledCallbacks.length = 0;
     console.log('[Discord] 适配器已停止');
   }
 
@@ -569,7 +536,7 @@ export class DiscordAdapter implements PlatformAdapter {
       fileSize: attachment.size,
     }));
 
-    const chatType = message.channel.type === ChannelType.DM ? 'p2p' as const : 'group' as const;
+    const chatType = message.channel.type === 1 /* ChannelType.DM */ ? 'p2p' as const : 'group' as const;
     const event: PlatformMessageEvent = {
       platform: 'discord',
       conversationId: message.channelId,

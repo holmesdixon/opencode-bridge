@@ -1,57 +1,24 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { EffortLevel } from '../commands/effort.js';
+import type {
+  ChatSessionData,
+  SessionAliasRecord,
+  InteractionRecord,
+  SessionBindingOptions,
+  ConversationBindingRecord,
+  ChatSessionType,
+  SessionOrderMode,
+} from './session-types.js';
 
-export type ChatSessionType = 'p2p' | 'group';
-
-export interface ChatSessionData {
-  chatId: string;
-  sessionId: string;
-  sessionDirectory?: string;
-  creatorId: string;
-  createdAt: number;
-  title?: string;
-  chatType?: ChatSessionType;
-  protectSessionDelete?: boolean;
-  lastFeishuUserMsgId?: string;
-  lastFeishuAiMsgId?: string;
-  preferredModel?: string;
-  preferredAgent?: string;
-  preferredEffort?: EffortLevel;
-  resolvedDirectory?: string;
-  projectName?: string;
-  defaultDirectory?: string;
-  reminderSent?: boolean;
-  interactionHistory: InteractionRecord[];
-}
-
-interface SessionAliasRecord {
-  chatId: string;
-  expiresAt: number;
-}
-
-export interface InteractionRecord {
-  userFeishuMsgId: string;
-  openCodeMsgId: string;
-  botFeishuMsgIds: string[];
-  type: 'normal' | 'question_prompt' | 'question_answer';
-  cardData?: any;
-  timestamp: number;
-}
-
-export interface SessionBindingOptions {
-  protectSessionDelete?: boolean;
-  chatType?: ChatSessionType;
-  sessionDirectory?: string;
-  resolvedDirectory?: string;
-  projectName?: string;
-}
-
-export interface ConversationBindingRecord {
-  platform: string;
-  conversationId: string;
-  session: ChatSessionData;
-}
+export type {
+  ChatSessionData,
+  InteractionRecord,
+  SessionBindingOptions,
+  ConversationBindingRecord,
+  ChatSessionType,
+  SessionOrderMode,
+} from './session-types.js';
 
 const STORE_FILE = path.join(process.cwd(), '.chat-sessions.json');
 const SESSION_ALIAS_TTL_MS = 10 * 60 * 1000;
@@ -61,6 +28,8 @@ type PlatformId = string;
 class ChatSessionStore {
   private data: Map<string, ChatSessionData> = new Map();
   private sessionAliases: Map<string, SessionAliasRecord> = new Map();
+  // 反向索引：chatId -> Set<storageKey>，加速会话别名清理
+  private chatIdToKeysIndex: Map<string, Set<string>> = new Map();
 
   constructor() {
     this.load();
@@ -77,12 +46,52 @@ class ChatSessionStore {
           migratedEntries.push([normalizedKey, value]);
         }
         this.data = new Map(migratedEntries);
+        // 重建反向索引
+        this.rebuildChatIdIndex();
         console.log(`[Store] 已加载 ${this.data.size} 个群组会话`);
         this.save();
       }
     } catch (error) {
       console.error('[Store] 加载数据失败:', error);
     }
+  }
+
+  // 重建 chatId 反向索引
+  private rebuildChatIdIndex(): void {
+    this.chatIdToKeysIndex.clear();
+    for (const [key] of this.data) {
+      const parsed = this.parseConversationKey(key);
+      const chatId = parsed ? parsed.chatId : key;
+      if (!this.chatIdToKeysIndex.has(chatId)) {
+        this.chatIdToKeysIndex.set(chatId, new Set());
+      }
+      this.chatIdToKeysIndex.get(chatId)!.add(key);
+    }
+  }
+
+  // 更新反向索引（添加）
+  private addToChatIdIndex(chatId: string, key: string): void {
+    if (!this.chatIdToKeysIndex.has(chatId)) {
+      this.chatIdToKeysIndex.set(chatId, new Set());
+    }
+    this.chatIdToKeysIndex.get(chatId)!.add(key);
+  }
+
+  // 更新反向索引（移除）
+  private removeFromChatIdIndex(chatId: string, key: string): void {
+    const keys = this.chatIdToKeysIndex.get(chatId);
+    if (keys) {
+      keys.delete(key);
+      if (keys.size === 0) {
+        this.chatIdToKeysIndex.delete(chatId);
+      }
+    }
+  }
+
+  // 检查 chatId 是否有对应的存储键
+  private hasChatIdInIndex(chatId: string): boolean {
+    const keys = this.chatIdToKeysIndex.get(chatId);
+    return keys !== undefined && keys.size > 0;
   }
 
   private save(): void {
@@ -246,10 +255,8 @@ class ChatSessionStore {
   private cleanupExpiredSessionAliases(): void {
     const now = Date.now();
     for (const [sessionId, alias] of this.sessionAliases.entries()) {
-      const hasMatchingKey = Array.from(this.data.keys()).some(key => {
-        const parsed = this.parseConversationKey(key);
-        return parsed ? parsed.chatId === alias.chatId : key === alias.chatId;
-      });
+      // 使用反向索引检查，O(1) 复杂度
+      const hasMatchingKey = this.hasChatIdInIndex(alias.chatId);
       if (alias.expiresAt <= now || !hasMatchingKey) {
         this.sessionAliases.delete(sessionId);
       }
@@ -263,7 +270,11 @@ class ChatSessionStore {
       }
 
       this.data.delete(key);
+      // 同步更新反向索引
       const parsed = this.parseConversationKey(key);
+      const chatId = parsed ? parsed.chatId : key;
+      this.removeFromChatIdIndex(chatId, key);
+
       if (parsed) {
         console.log(`[Store] 会话 ${sessionId} 已改绑，移除旧绑定: ${parsed.platform}:${parsed.chatId}`);
       } else {
@@ -309,6 +320,13 @@ class ChatSessionStore {
       || this.inferChatTypeFromTitle(title)
       || this.inferChatTypeFromTitle(current?.title);
 
+    const preservedInteractionHistory = Array.isArray(current?.interactionHistory)
+      ? current.interactionHistory.map(record => ({
+          ...record,
+          botFeishuMsgIds: Array.isArray(record.botFeishuMsgIds) ? [...record.botFeishuMsgIds] : [],
+        }))
+      : [];
+
     const data: ChatSessionData = {
       chatId: conversationId,
       sessionId,
@@ -321,14 +339,23 @@ class ChatSessionStore {
       ...(options?.resolvedDirectory ? { resolvedDirectory: options.resolvedDirectory } : {}),
       ...(options?.projectName ? { projectName: options.projectName } : {}),
       ...(current?.defaultDirectory ? { defaultDirectory: current.defaultDirectory } : {}),
+      ...(current?.sessionOrderMode ? { sessionOrderMode: current.sessionOrderMode } : {}),
+      ...(typeof current?.qqOutputOnlyText === 'boolean' ? { qqOutputOnlyText: current.qqOutputOnlyText } : {}),
+      ...(typeof current?.helpWithQc === 'boolean' ? { helpWithQc: current.helpWithQc } : {}),
+      ...(typeof current?.sessionWithCtl === 'boolean' ? { sessionWithCtl: current.sessionWithCtl } : {}),
+      ...(typeof current?.sessionWithChange === 'boolean' ? { sessionWithChange: current.sessionWithChange } : {}),
       ...(current?.preferredModel ? { preferredModel: current.preferredModel } : {}),
       ...(current?.preferredAgent ? { preferredAgent: current.preferredAgent } : {}),
       ...(current?.preferredEffort ? { preferredEffort: current.preferredEffort } : {}),
-      interactionHistory: [],
+      ...(current?.lastFeishuUserMsgId ? { lastFeishuUserMsgId: current.lastFeishuUserMsgId } : {}),
+      ...(current?.lastFeishuAiMsgId ? { lastFeishuAiMsgId: current.lastFeishuAiMsgId } : {}),
+      interactionHistory: preservedInteractionHistory,
     };
 
     this.removeExistingBindingsForSession(sessionId, key);
     this.data.set(key, data);
+    // 更新反向索引
+    this.addToChatIdIndex(conversationId, key);
     this.save();
     console.log(`[Store] 绑定成功: platform=${platform}, conversation=${conversationId} -> session=${sessionId}`);
   }
@@ -364,6 +391,13 @@ class ChatSessionStore {
       || this.inferChatTypeFromTitle(title)
       || this.inferChatTypeFromTitle(current?.title);
 
+    const preservedInteractionHistory = Array.isArray(current?.interactionHistory)
+      ? current.interactionHistory.map(record => ({
+          ...record,
+          botFeishuMsgIds: Array.isArray(record.botFeishuMsgIds) ? [...record.botFeishuMsgIds] : [],
+        }))
+      : [];
+
     const data: ChatSessionData = {
       chatId,
       sessionId,
@@ -376,14 +410,23 @@ class ChatSessionStore {
       ...(options?.resolvedDirectory ? { resolvedDirectory: options.resolvedDirectory } : {}),
       ...(options?.projectName ? { projectName: options.projectName } : {}),
       ...(current?.defaultDirectory ? { defaultDirectory: current.defaultDirectory } : {}),
+      ...(current?.sessionOrderMode ? { sessionOrderMode: current.sessionOrderMode } : {}),
+      ...(typeof current?.qqOutputOnlyText === 'boolean' ? { qqOutputOnlyText: current.qqOutputOnlyText } : {}),
+      ...(typeof current?.helpWithQc === 'boolean' ? { helpWithQc: current.helpWithQc } : {}),
+      ...(typeof current?.sessionWithCtl === 'boolean' ? { sessionWithCtl: current.sessionWithCtl } : {}),
+      ...(typeof current?.sessionWithChange === 'boolean' ? { sessionWithChange: current.sessionWithChange } : {}),
       ...(current?.preferredModel ? { preferredModel: current.preferredModel } : {}),
       ...(current?.preferredAgent ? { preferredAgent: current.preferredAgent } : {}),
       ...(current?.preferredEffort ? { preferredEffort: current.preferredEffort } : {}),
-      interactionHistory: [],
+      ...(current?.lastFeishuUserMsgId ? { lastFeishuUserMsgId: current.lastFeishuUserMsgId } : {}),
+      ...(current?.lastFeishuAiMsgId ? { lastFeishuAiMsgId: current.lastFeishuAiMsgId } : {}),
+      interactionHistory: preservedInteractionHistory,
     };
 
     this.removeExistingBindingsForSession(sessionId, namespacedKey);
     this.data.set(namespacedKey, data);
+    // 更新反向索引
+    this.addToChatIdIndex(chatId, namespacedKey);
     this.save();
     console.log(`[Store] 绑定成功: chat=${chatId} (namespaced: ${namespacedKey}) -> session=${sessionId}`);
   }
@@ -459,6 +502,11 @@ class ChatSessionStore {
       preferredAgent?: string;
       preferredEffort?: EffortLevel;
       defaultDirectory?: string;
+      sessionOrderMode?: SessionOrderMode;
+      qqOutputOnlyText?: boolean;
+      helpWithQc?: boolean;
+      sessionWithCtl?: boolean;
+      sessionWithChange?: boolean;
     }
   ): void {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
@@ -495,6 +543,46 @@ class ChatSessionStore {
         delete session.defaultDirectory;
       }
     }
+
+    if ('sessionOrderMode' in config) {
+      if (config.sessionOrderMode) {
+        session.sessionOrderMode = config.sessionOrderMode;
+      } else {
+        delete session.sessionOrderMode;
+      }
+    }
+
+    if ('qqOutputOnlyText' in config) {
+      if (typeof config.qqOutputOnlyText === 'boolean') {
+        session.qqOutputOnlyText = config.qqOutputOnlyText;
+      } else {
+        delete session.qqOutputOnlyText;
+      }
+    }
+
+    if ('helpWithQc' in config) {
+      if (typeof config.helpWithQc === 'boolean') {
+        session.helpWithQc = config.helpWithQc;
+      } else {
+        delete session.helpWithQc;
+      }
+    }
+
+    if ('sessionWithCtl' in config) {
+      if (typeof config.sessionWithCtl === 'boolean') {
+        session.sessionWithCtl = config.sessionWithCtl;
+      } else {
+        delete session.sessionWithCtl;
+      }
+    }
+
+    if ('sessionWithChange' in config) {
+      if (typeof config.sessionWithChange === 'boolean') {
+        session.sessionWithChange = config.sessionWithChange;
+      } else {
+        delete session.sessionWithChange;
+      }
+    }
     this.save();
   }
 
@@ -506,6 +594,11 @@ class ChatSessionStore {
       preferredAgent?: string;
       preferredEffort?: EffortLevel;
       defaultDirectory?: string;
+      sessionOrderMode?: SessionOrderMode;
+      qqOutputOnlyText?: boolean;
+      helpWithQc?: boolean;
+      sessionWithCtl?: boolean;
+      sessionWithChange?: boolean;
     }
   ): void {
     const session = this.getSessionByConversation(platform, conversationId);
@@ -543,11 +636,59 @@ class ChatSessionStore {
       }
     }
 
+    if ('sessionOrderMode' in config) {
+      if (config.sessionOrderMode) {
+        session.sessionOrderMode = config.sessionOrderMode;
+      } else {
+        delete session.sessionOrderMode;
+      }
+    }
+
+    if ('qqOutputOnlyText' in config) {
+      if (typeof config.qqOutputOnlyText === 'boolean') {
+        session.qqOutputOnlyText = config.qqOutputOnlyText;
+      } else {
+        delete session.qqOutputOnlyText;
+      }
+    }
+
+    if ('helpWithQc' in config) {
+      if (typeof config.helpWithQc === 'boolean') {
+        session.helpWithQc = config.helpWithQc;
+      } else {
+        delete session.helpWithQc;
+      }
+    }
+
+    if ('sessionWithCtl' in config) {
+      if (typeof config.sessionWithCtl === 'boolean') {
+        session.sessionWithCtl = config.sessionWithCtl;
+      } else {
+        delete session.sessionWithCtl;
+      }
+    }
+
+    if ('sessionWithChange' in config) {
+      if (typeof config.sessionWithChange === 'boolean') {
+        session.sessionWithChange = config.sessionWithChange;
+      } else {
+        delete session.sessionWithChange;
+      }
+    }
+
     this.save();
   }
 
   updateTitle(chatId: string, title: string): void {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (session) {
+      session.title = title;
+      this.save();
+    }
+  }
+
+  updateTitleByConversation(platform: string, conversationId: string, title: string): void {
+    const session = this.getSessionByConversation(platform, conversationId);
     if (session) {
       session.title = title;
       this.save();
@@ -616,6 +757,18 @@ class ChatSessionStore {
     return undefined;
   }
 
+  popInteractionByConversation(platform: string, conversationId: string): InteractionRecord | undefined {
+    const session = this.getSessionByConversation(platform, conversationId);
+    if (session && session.interactionHistory && session.interactionHistory.length > 0) {
+      const record = session.interactionHistory.pop();
+
+      this.updateLegacyPointers(session);
+      this.save();
+      return record;
+    }
+    return undefined;
+  }
+
   getLastInteraction(chatId: string): InteractionRecord | undefined {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
     if (session && session.interactionHistory && session.interactionHistory.length > 0) {
@@ -652,6 +805,36 @@ class ChatSessionStore {
     }
   }
 
+  ensureInteraction(chatId: string, record: InteractionRecord): void {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (!session) {
+      return;
+    }
+
+    if (!session.interactionHistory) {
+      session.interactionHistory = [];
+    }
+
+    const existing = session.interactionHistory.find(item => item.userFeishuMsgId === record.userFeishuMsgId);
+    if (existing) {
+      return;
+    }
+
+    session.interactionHistory.push({
+      ...record,
+      botFeishuMsgIds: Array.isArray(record.botFeishuMsgIds) ? [...record.botFeishuMsgIds] : [],
+    });
+
+    this.updateLegacyPointers(session);
+
+    if (session.interactionHistory.length > 20) {
+      session.interactionHistory.shift();
+      this.updateLegacyPointers(session);
+    }
+
+    this.save();
+  }
+
   removeSession(chatId: string): void {
     const namespacedKey = this.legacyToNamespacedKey(chatId);
 
@@ -665,6 +848,8 @@ class ChatSessionStore {
         }
       }
       this.data.delete(namespacedKey);
+      // 同步更新反向索引
+      this.removeFromChatIdIndex(chatId, namespacedKey);
       this.save();
       console.log(`[Store] 移除绑定 (namespaced): chat=${chatId} -> ${namespacedKey}`);
       return;
@@ -677,6 +862,8 @@ class ChatSessionStore {
         }
       }
       this.data.delete(chatId);
+      // 同步更新反向索引
+      this.removeFromChatIdIndex(chatId, chatId);
       this.save();
       console.log(`[Store] 移除绑定 (legacy): chat=${chatId}`);
     }
@@ -694,6 +881,8 @@ class ChatSessionStore {
     }
 
     this.data.delete(key);
+    // 同步更新反向索引
+    this.removeFromChatIdIndex(conversationId, key);
     this.save();
     console.log(`[Store] 移除绑定 (platform): ${platform}:${conversationId}`);
   }

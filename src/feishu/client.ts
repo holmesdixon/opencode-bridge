@@ -2,274 +2,27 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { feishuConfig } from '../config.js';
 import { EventEmitter } from 'events';
 import type { ReadStream } from 'fs';
+import {
+  formatError,
+  isCompletionNotFoundError,
+  buildFallbackInteractiveCard,
+  collectAttachmentsFromContent,
+  extractTextFromPost,
+  isRetryableError,
+  withRetry,
+  extractApiCode,
+  isUniversalCardBuildFailure,
+  getString,
+  getNumber,
+  DEFAULT_RETRY_OPTIONS,
+  type ConnectionState,
+  type FeishuEventData,
+  type FeishuMessageEvent,
+  type FeishuCardActionEvent,
+  type FeishuCardActionResponse,
+  type FeishuAttachment,
+} from './client-utils.js';
 
-function formatError(error: unknown): { message: string; responseData?: unknown } {
-  if (error instanceof Error) {
-    const responseData = typeof error === 'object' && error !== null && 'response' in error
-      ? (error as { response?: { data?: unknown } }).response?.data
-      : undefined;
-    return { message: `${error.name}: ${error.message}`, responseData };
-  }
-
-  const responseData = typeof error === 'object' && error !== null && 'response' in error
-    ? (error as { response?: { data?: unknown } }).response?.data
-    : undefined;
-
-  let message = '';
-  try {
-    message = JSON.stringify(error);
-  } catch {
-    message = String(error);
-  }
-
-  return { message, responseData };
-}
-
-function extractApiCode(responseData: unknown): number | undefined {
-  if (!responseData || typeof responseData !== 'object') return undefined;
-  const value = (responseData as { code?: unknown }).code;
-  if (typeof value === 'number') return value;
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    return Number.isNaN(parsed) ? undefined : parsed;
-  }
-  return undefined;
-}
-
-function stringifyErrorPayload(payload: unknown): string {
-  if (typeof payload === 'string') {
-    return payload;
-  }
-  try {
-    return JSON.stringify(payload);
-  } catch {
-    return String(payload);
-  }
-}
-
-function isUniversalCardBuildFailure(responseData: unknown): boolean {
-  const apiCode = extractApiCode(responseData);
-  if (apiCode === 230099) {
-    return true;
-  }
-
-  const text = stringifyErrorPayload(responseData).toLowerCase();
-  return text.includes('230099')
-    || text.includes('200800')
-    || text.includes('create universal card fail');
-}
-
-function buildFallbackInteractiveCard(sourceCard: object): object {
-  const cardRecord = sourceCard as {
-    header?: {
-      title?: { content?: unknown };
-      template?: unknown;
-    };
-  };
-  const rawTitle = cardRecord.header?.title?.content;
-  const title = typeof rawTitle === 'string' && rawTitle.trim()
-    ? rawTitle.trim().slice(0, 60)
-    : 'OpenCode 输出（已精简）';
-  const rawTemplate = cardRecord.header?.template;
-  const template = typeof rawTemplate === 'string' && rawTemplate.trim()
-    ? rawTemplate.trim()
-    : 'blue';
-
-  return {
-    schema: '2.0',
-    config: {
-      wide_screen_mode: true,
-    },
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: title,
-      },
-      template,
-    },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: '⚠️ 卡片内容过长或结构超限，已自动精简显示。\n请在 OpenCode Web 查看完整输出。',
-        },
-      ],
-    },
-  };
-}
-
-// 飞书事件数据类型（SDK 未导出，手动定义）
-interface FeishuEventData {
-  event_id?: string;
-  token?: string;
-  create_time?: string;
-  event_type?: string;
-  tenant_key?: string;
-  ts?: string;
-  uuid?: string;
-  type?: string;
-  app_id?: string;
-  sender: {
-    sender_id?: {
-      union_id?: string;
-      user_id?: string;
-      open_id?: string;
-    };
-    sender_type: string;
-    tenant_key?: string;
-  };
-  message: {
-    message_id: string;
-    root_id?: string;
-    parent_id?: string;
-    create_time: string;
-    update_time?: string;
-    chat_id: string;
-    thread_id?: string;
-    chat_type: string;
-    message_type: string;
-    content: string;
-    mentions?: Array<{
-      key: string;
-      id: {
-        union_id?: string;
-        user_id?: string;
-        open_id?: string;
-      };
-      name: string;
-      tenant_key?: string;
-    }>;
-    user_agent?: string;
-  };
-}
-
-// 消息事件类型
-export interface FeishuMessageEvent {
-  messageId: string;
-  chatId: string;
-  threadId?: string;
-  chatType: 'p2p' | 'group';
-  senderId: string;
-  senderType: 'user' | 'bot';
-  content: string;
-  msgType: string;
-  attachments?: FeishuAttachment[];
-  mentions?: Array<{ key: string; id: { open_id: string }; name: string }>;
-  rawEvent: FeishuEventData;
-}
-
-export interface FeishuAttachment {
-  type: 'image' | 'file';
-  fileKey: string;
-  fileName?: string;
-  fileType?: string;
-  fileSize?: number;
-}
-
-function getString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
-
-function getNumber(value: unknown): number | undefined {
-  if (typeof value === 'number') return value;
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    return Number.isNaN(parsed) ? undefined : parsed;
-  }
-  return undefined;
-}
-
-function collectAttachmentsFromContent(content: unknown): FeishuAttachment[] {
-  if (!content || typeof content !== 'object') return [];
-  const attachments: FeishuAttachment[] = [];
-  const visited = new Set<object>();
-  const stack: unknown[] = [content];
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current || typeof current !== 'object') continue;
-    if (visited.has(current as object)) continue;
-    visited.add(current as object);
-
-    if (Array.isArray(current)) {
-      for (const item of current) stack.push(item);
-      continue;
-    }
-
-    const record = current as Record<string, unknown>;
-    const imageKey = getString(record.image_key) || getString(record.imageKey);
-    if (imageKey) {
-      attachments.push({ type: 'image', fileKey: imageKey });
-    }
-
-    const fileKey = getString(record.file_key) || getString(record.fileKey);
-    if (fileKey) {
-      attachments.push({
-        type: 'file',
-        fileKey,
-        fileName: getString(record.file_name) || getString(record.fileName),
-        fileType: getString(record.file_type) || getString(record.fileType),
-        fileSize: getNumber(record.file_size) || getNumber(record.fileSize),
-      });
-    }
-
-    for (const value of Object.values(record)) {
-      stack.push(value);
-    }
-  }
-
-  return attachments;
-}
-
-function extractTextFromPost(content: unknown): string {
-  if (!content || typeof content !== 'object') return '';
-  const record = content as { content?: unknown; title?: unknown };
-  const parts: string[] = [];
-  const root = record.content;
-  if (!root) return '';
-  const stack: unknown[] = [root];
-  const visited = new Set<object>();
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current || typeof current !== 'object') continue;
-    if (visited.has(current as object)) continue;
-    visited.add(current as object);
-
-    if (Array.isArray(current)) {
-      for (const item of current) stack.push(item);
-      continue;
-    }
-
-    const node = current as Record<string, unknown>;
-    const tag = getString(node.tag);
-    if ((tag === 'text' || tag === 'a') && typeof node.text === 'string') {
-      parts.push(node.text);
-    }
-
-    for (const value of Object.values(node)) {
-      stack.push(value);
-    }
-  }
-
-  return parts.join('');
-}
-
-// 卡片动作事件类型
-export interface FeishuCardActionEvent {
-  openId: string;
-  action: {
-    tag: string;
-    value: Record<string, unknown>;
-  };
-  token: string;
-  messageId?: string;
-  chatId?: string;
-  threadId?: string;
-  rawEvent: unknown;
-}
-
-export type FeishuCardActionResponse = object;
 
 class FeishuClient extends EventEmitter {
   private client: lark.Client;
@@ -278,24 +31,130 @@ class FeishuClient extends EventEmitter {
   private cardActionHandler?: (event: FeishuCardActionEvent) => Promise<FeishuCardActionResponse | void>;
   private cardUpdateQueue: Map<string, Promise<boolean>> = new Map();
 
+  // 连接状态和心跳检测
+  private connectionState: ConnectionState = 'disconnected';
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private lastHeartbeatAt: number = 0;
+  private heartbeatFailureCount: number = 0;
+  private readonly HEARTBEAT_INTERVAL_MS = 30000; // 30秒
+  private readonly HEARTBEAT_FAILURE_THRESHOLD = 3; // 连续失败3次认为断连
+
+  // 机器人自身信息
+  private botOpenId: string | null = null;
+
   constructor() {
     super();
     this.client = new lark.Client({
       appId: feishuConfig.appId,
       appSecret: feishuConfig.appSecret,
       disableTokenCache: false,
+      // 仅输出 error 及以上级别日志，避免未配置时输出大量 warn
+      loggerLevel: lark.LoggerLevel.error,
     });
 
     // 创建事件分发器
-    this.eventDispatcher = new lark.EventDispatcher({
+    this.eventDispatcher = this.createEventDispatcher();
+  }
+
+  private createEventDispatcher(): lark.EventDispatcher {
+    return new lark.EventDispatcher({
       encryptKey: feishuConfig.encryptKey,
       verificationToken: feishuConfig.verificationToken,
     });
   }
 
+  // 获取机器人 open_id
+  getBotOpenId(): string | null {
+    return this.botOpenId;
+  }
+
+  // 获取上次心跳时间
+  getLastHeartbeatAt(): number {
+    return this.lastHeartbeatAt;
+  }
+
+  // 启动心跳检测
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      return;
+    }
+
+    this.heartbeatTimer = setInterval(async () => {
+      await this.performHeartbeat();
+    }, this.HEARTBEAT_INTERVAL_MS);
+
+    console.log('[飞书] 心跳检测已启动');
+  }
+
+  // 停止心跳检测
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    console.log('[飞书] 心跳检测已停止');
+  }
+
+  // 执行心跳检测
+  private async performHeartbeat(): Promise<void> {
+    try {
+      // 调用 chat.list 接口验证 API 连接（轻量级只读操作）
+      await this.client.im.chat.list({
+        params: { page_size: 1 },
+      });
+      this.lastHeartbeatAt = Date.now();
+      this.heartbeatFailureCount = 0;
+
+      // 如果之前是断连状态，现在恢复了
+      if (this.connectionState !== 'connected') {
+        this.connectionState = 'connected';
+        console.log('[飞书] 连接已恢复');
+        this.emit('connectionRestored');
+      }
+    } catch (error) {
+      this.heartbeatFailureCount++;
+      console.warn(`[飞书] 心跳检测失败（第 ${this.heartbeatFailureCount} 次）: ${error instanceof Error ? error.message : String(error)}`);
+
+      // 连续失败超过阈值，认为断连
+      if (this.heartbeatFailureCount >= this.HEARTBEAT_FAILURE_THRESHOLD) {
+        if (this.connectionState === 'connected') {
+          this.connectionState = 'disconnected';
+          console.error('[飞书] 连接已断开');
+          this.emit('connectionLost');
+        }
+      }
+    }
+  }
+
+  // 获取机器人信息
+  private async fetchBotInfo(): Promise<void> {
+    try {
+      // 使用 SDK 的 request 方法调用 bot.v3.info API
+      // SDK 会自动处理 tenant_access_token 的获取和刷新
+      const response = await (this.client as unknown as Record<string, (payload: unknown) => Promise<unknown>>).request(
+        {
+          method: 'GET',
+          url: 'https://open.feishu.cn/open-apis/bot/v3/info',
+        }
+      );
+
+      const data = response as { code?: number; bot?: { open_id?: string } };
+      if (data.code === 0 && data.bot?.open_id) {
+        this.botOpenId = data.bot.open_id;
+        console.log(`[飞书] 获取机器人信息成功: open_id=${this.botOpenId.slice(0, 16)}...`);
+      } else {
+        console.warn('[飞书] 获取机器人信息失败: 响应格式异常', data);
+      }
+    } catch (error) {
+      const formatted = formatError(error);
+      console.warn('[飞书] 获取机器人信息失败:', formatted.message);
+    }
+  }
+
   // 启动长连接
   async start(): Promise<void> {
     console.log('[飞书] 正在启动长连接...');
+    this.connectionState = 'connecting';
 
     // 注册消息接收事件
     this.eventDispatcher.register({
@@ -325,7 +184,14 @@ class FeishuClient extends EventEmitter {
 
     // 启动连接
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+    this.connectionState = 'connected';
     console.log('[飞书] 长连接已建立');
+
+    // 获取机器人自身信息
+    await this.fetchBotInfo();
+
+    // 启动心跳检测
+    this.startHeartbeat();
   }
 
   // 监听群成员退群事件
@@ -538,7 +404,8 @@ class FeishuClient extends EventEmitter {
       return { msg: 'ok' };
     } catch (error) {
       console.error('[飞书] 解析卡片事件失败:', error);
-      return { msg: 'ok' };
+      // 返回错误提示，但仍返回 200 避免飞书重试
+      return { msg: 'ok', error: '卡片事件处理失败，请稍后重试' };
     }
   }
 
@@ -567,14 +434,17 @@ class FeishuClient extends EventEmitter {
   // 发送文本消息
   async sendText(chatId: string, text: string): Promise<string | null> {
     try {
-      const response = await this.client.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text }),
-        },
-      });
+      const response = await withRetry(
+        () => this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'text',
+            content: JSON.stringify({ text }),
+          },
+        }),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 3000 }
+      );
 
       const msgId = response.data?.message_id || null;
       if (msgId) {
@@ -600,13 +470,16 @@ class FeishuClient extends EventEmitter {
   // 回复消息
   async reply(messageId: string, text: string): Promise<string | null> {
     try {
-      const response = await this.client.im.message.reply({
-        path: { message_id: messageId },
-        data: {
-          msg_type: 'text',
-          content: JSON.stringify({ text }),
-        },
-      });
+      const response = await withRetry(
+        () => this.client.im.message.reply({
+          path: { message_id: messageId },
+          data: {
+            msg_type: 'text',
+            content: JSON.stringify({ text }),
+          },
+        }),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 3000 }
+      );
 
       const msgId = response.data?.message_id || null;
       if (msgId) {
@@ -626,13 +499,16 @@ class FeishuClient extends EventEmitter {
   // 回复卡片
   async replyCard(messageId: string, card: object): Promise<string | null> {
     try {
-      const response = await this.client.im.message.reply({
-        path: { message_id: messageId },
-        data: {
-          msg_type: 'interactive',
-          content: JSON.stringify(card),
-        },
-      });
+      const response = await withRetry(
+        () => this.client.im.message.reply({
+          path: { message_id: messageId },
+          data: {
+            msg_type: 'interactive',
+            content: JSON.stringify(card),
+          },
+        }),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 3000 }
+      );
 
       const msgId = response.data?.message_id || null;
       if (msgId) {
@@ -673,10 +549,13 @@ class FeishuClient extends EventEmitter {
         msg_type: 'interactive',
         content: JSON.stringify(card),
       } as unknown as { content: string };
-      await this.client.im.message.patch({
-        path: { message_id: messageId },
-        data,
-      });
+      await withRetry(
+        () => this.client.im.message.patch({
+          path: { message_id: messageId },
+          data,
+        }),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 3000 }
+      );
       console.log(`[飞书] 更新卡片成功: msgId=${messageId.slice(0, 16)}...`);
       return true;
     } catch (error) {
@@ -735,14 +614,17 @@ class FeishuClient extends EventEmitter {
   // 发送消息卡片
   async sendCard(chatId: string, card: object): Promise<string | null> {
     try {
-      const response = await this.client.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: JSON.stringify(card),
-        },
-      });
+      const response = await withRetry(
+        () => this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: JSON.stringify(card),
+          },
+        }),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 3000 }
+      );
 
       const msgId = response.data?.message_id || null;
       if (msgId) {
@@ -1105,13 +987,22 @@ class FeishuClient extends EventEmitter {
 
   // 停止长连接
   stop(): void {
+    this.stopHeartbeat();
     if (this.wsClient) {
       this.wsClient.close();
       this.wsClient = null;
     }
+    this.eventDispatcher = this.createEventDispatcher();
+    this.cardActionHandler = undefined;
+    this.cardUpdateQueue.clear();
+    this.connectionState = 'disconnected';
     console.log('[飞书] 已断开连接');
   }
 }
 
 // 单例导出
 export const feishuClient = new FeishuClient();
+
+// 向后兼容的类型重导出
+export type { FeishuMessageEvent, FeishuCardActionEvent, FeishuCardActionResponse, FeishuAttachment } from './client-utils.js';
+export { isCompletionNotFoundError } from './client-utils.js';

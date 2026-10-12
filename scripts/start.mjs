@@ -1,5 +1,14 @@
 #!/usr/bin/env node
 
+/**
+ * 启动后台进程脚本
+ *
+ * 功能:
+ * - 调用 process-manager.mjs 清理旧进程
+ * - 构建项目（如果需要）
+ * - 启动 Admin 服务（Admin 会自动启动 Bridge 子进程）
+ */
+
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -13,7 +22,11 @@ const logsDir = path.join(rootDir, 'logs');
 const pidFile = path.join(logsDir, 'bridge.pid');
 const outLog = path.join(logsDir, 'service.log');
 const errLog = path.join(logsDir, 'service.err');
-const entryFile = path.join(rootDir, 'dist', 'index.js');
+const adminEntryFile = path.join(rootDir, 'dist', 'admin', 'index.js');
+const processManagerPath = path.join(rootDir, 'scripts', 'process-manager.mjs');
+
+// 是否跳过 opencode serve 启动（用于已由外部管理 opencode 的场景）
+const skipOpencodeStart = process.argv.includes('--no-opencode');
 
 function isWindows() {
   return process.platform === 'win32';
@@ -60,6 +73,7 @@ function runNpm(args) {
     const result = spawnSync(variant.command, variant.args, {
       cwd: rootDir,
       stdio: 'inherit',
+      windowsHide: isWindows(),
     });
 
     if (result.error) {
@@ -77,32 +91,28 @@ function runNpm(args) {
   return lastResult;
 }
 
-function readPid() {
-  if (!fs.existsSync(pidFile)) {
-    return null;
-  }
-
-  const raw = fs.readFileSync(pidFile, 'utf-8').trim();
-  const pid = Number.parseInt(raw, 10);
-  return Number.isNaN(pid) ? null : pid;
-}
-
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+function ensureLogDir() {
+  fs.mkdirSync(logsDir, { recursive: true });
 }
 
 function ensureBuildIfMissing() {
-  if (fs.existsSync(entryFile)) {
+  const webEntryFile = path.join(rootDir, 'dist', 'public', 'index.html');
+  const backendMissing = !fs.existsSync(adminEntryFile);
+  const frontendMissing = !fs.existsSync(webEntryFile);
+
+  if (!backendMissing && !frontendMissing) {
     return;
   }
 
-  console.log('[start] 未检测到 dist/index.js，开始自动构建');
-  const result = runNpm(['run', 'build']);
+  if (backendMissing && frontendMissing) {
+    console.log('[start] 未检测到构建产物，开始自动全量构建');
+  } else if (backendMissing) {
+    console.log('[start] 未检测到 dist/admin/index.js，开始自动构建');
+  } else {
+    console.log('[start] 未检测到 dist/public/index.html，开始自动构建前端控制台');
+  }
+
+  const result = runNpm(['run', 'build:all']);
 
   if (!result || result.error || result.status !== 0) {
     console.error('[start] 构建失败，启动中止');
@@ -110,19 +120,15 @@ function ensureBuildIfMissing() {
   }
 }
 
-function ensureLogDir() {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
-
-function startBridge() {
+function startAdmin() {
   const stdoutFd = fs.openSync(outLog, 'a');
   const stderrFd = fs.openSync(errLog, 'a');
 
-  const child = spawn(process.execPath, ['dist/index.js'], {
+  const child = spawn(process.execPath, [adminEntryFile], {
     cwd: rootDir,
     detached: true,
     stdio: ['ignore', stdoutFd, stderrFd],
-    windowsHide: true,
+    windowsHide: isWindows(),
   });
 
   child.unref();
@@ -131,25 +137,54 @@ function startBridge() {
 
   fs.writeFileSync(pidFile, String(child.pid), 'utf-8');
   console.log(`[start] 启动成功，PID=${child.pid}`);
-  console.log(`[start] 日志文件: ${outLog}`);
+  console.log(`[start] 日志文件：${outLog}`);
+}
+
+function sleep(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // 忙等待
+  }
+}
+
+function runProcessManager(args, options = {}) {
+  const result = spawnSync(process.execPath, [processManagerPath, ...args], {
+    stdio: 'pipe',
+    encoding: 'utf-8',
+    windowsHide: isWindows(),
+    ...options,
+  });
+  if (result.stdout?.trim()) console.log(result.stdout.trim());
+  if (result.stderr?.trim()) console.error(result.stderr.trim());
+  return result;
 }
 
 function main() {
   ensureLogDir();
 
-  const existingPid = readPid();
-  if (existingPid && isProcessAlive(existingPid)) {
-    console.log(`[start] 服务已在运行，PID=${existingPid}`);
-    console.log(`[start] 如需重启，请先执行: node scripts/stop.mjs`);
-    process.exit(0);
+  // 0. 启动 opencode serve（幂等 - 如果已在运行则跳过）
+  if (skipOpencodeStart) {
+    console.log('[start] 跳过 opencode serve 启动（--no-opencode）');
+  } else {
+    console.log('[start] 启动 opencode serve...');
+    const opencodeResult = runProcessManager(['start-opencode']);
+    if (opencodeResult.status !== 0) {
+      console.warn('[start] 警告：opencode serve 启动失败，继续启动 Bridge（可稍后手动启动 opencode）');
+    }
   }
 
-  if (existingPid && !isProcessAlive(existingPid)) {
-    fs.rmSync(pidFile, { force: true });
-  }
+  // 1. 调用进程管理工具清理旧 Bridge 进程（不传递 --exclude-self，因为这是独立调用）
+  console.log('[start] 清理旧 Bridge 进程...');
+  runProcessManager(['kill-bridge']);
+
+  // 2. 等待 3 秒，确保旧进程完全退出
+  console.log('[start] 等待进程退出...');
+  sleep(3000);
 
   ensureBuildIfMissing();
-  startBridge();
+
+  // 3. 启动 Admin 服务（Admin 会自动启动 Bridge 子进程）
+  startAdmin();
 }
 
 main();

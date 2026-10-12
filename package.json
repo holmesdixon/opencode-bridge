@@ -1,10 +1,13 @@
 {
   "name": "opencode-bridge",
-  "version": "2.9.0",
+  "version": "3.1.6",
   "type": "module",
   "description": "Feishu / Discord × OpenCode bridge service with runtime cron and reliability tooling",
-  "main": "dist/index.js",
+  "main": "dist-electron/main.js",
   "types": "dist/index.d.ts",
+  "author": "HNGM-HP",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/HNGM-HP/opencode-bridge#readme",
   "bin": {
     "opencode-bridge": "bin/opencode-bridge.js"
   },
@@ -18,16 +21,30 @@
   "files": [
     "bin",
     "dist",
+    "scripts",
     "README.md",
     "LICENSE",
     ".env.example"
   ],
   "scripts": {
+    "preinstall": "node scripts/setup-mirror.mjs",
     "dev": "tsx watch src/index.ts",
+    "dev:electron": "npm run build:electron && electron .",
     "build": "tsc",
+    "build:web": "cd web && pnpm install && pnpm run build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:all": "npm run build:web && npm run build && npm run build:electron",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "pack": "electron-builder --dir",
+    "prepare:pack": "node scripts/prepare-prod-modules.mjs",
+    "clean:pack": "node scripts/cleanup-prod-modules.mjs",
+    "dist": "npm run prepare:pack && electron-builder --publish never",
+    "dist:win": "npm run prepare:pack && electron-builder --win --publish never",
+    "dist:mac": "npm run prepare:pack && electron-builder --mac --publish never",
+    "dist:linux": "npm run prepare:pack && electron-builder --linux --publish never",
     "test": "vitest run",
     "test:watch": "vitest",
-    "start": "node dist/index.js",
+    "start": "node scripts/start.mjs",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run build",
     "deploy:bridge": "node scripts/deploy.mjs deploy",
@@ -44,8 +61,6 @@
     "chatbot",
     "ai"
   ],
-  "author": "HNGM-HP",
-  "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HNGM-HP/opencode-bridge.git"
@@ -53,21 +68,162 @@
   "bugs": {
     "url": "https://github.com/HNGM-HP/opencode-bridge/issues"
   },
-  "homepage": "https://github.com/HNGM-HP/opencode-bridge#readme",
   "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@inquirer/prompts": "^8.4.2",
     "@larksuiteoapi/node-sdk": "^1.36.3",
     "@opencode-ai/sdk": "latest",
+    "@wecom/aibot-node-sdk": "^1.0.4",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "axios": "^1.13.6",
+    "better-sqlite3": "^12.8.0",
+    "chokidar": "^5.0.0",
+    "dingtalk-stream": "^2.1.4",
     "discord.js": "^14.25.1",
     "dotenv": "^16.4.5",
-    "node-cron": "^4.2.1"
+    "express": "^5.2.1",
+    "grammy": "^1.41.1",
+    "gray-matter": "^4.0.3",
+    "multer": "^2.1.1",
+    "node-cron": "^4.2.1",
+    "qrcode": "^1.5.4",
+    "simple-git": "^3.36.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@grammyjs/types": "^3.25.0",
+    "@types/axios": "^0.14.4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
     "@types/node": "^22.10.0",
+    "@types/pino": "^7.0.5",
+    "@types/qrcode": "^1.5.6",
+    "@types/supertest": "^6.0.3",
+    "@types/ws": "^8.18.1",
+    "electron": "^34.5.8",
+    "electron-builder": "^25.1.8",
+    "electron-rebuild": "^3.2.9",
+    "pino": "^10.3.1",
+    "puppeteer": "^24.40.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "vitest": "^4.0.18"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
+  },
+  "build": {
+    "appId": "com.github.hngm-hp.opencode-bridge",
+    "productName": "OpenCode Bridge",
+    "copyright": "Copyright © 2024 HNGM-HP",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "assets/**/*",
+      "package.json",
+      "!**/*.ts",
+      "!**/*.{iml,o,hprof,orig,pyc,pyo,rbc,swp,csproj,sln,xproj}",
+      "!.editorconfig",
+      "!**/._*",
+      "!**/{.DS_Store,.git,.hg,.svn,CVS,RCS,SCCS,__pycache__,thumbs.db,.gitignore,.gitattributes,.flowconfig,.jshintrc,.eslintrc,.eslintignore,.idea,.vscode,.github}",
+      "!web/node_modules",
+      "!web/src"
+    ],
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "dist",
+        "to": "app/dist",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "assets",
+        "to": "app/assets",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "scripts",
+        "to": "app/scripts",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules_prod",
+        "to": "app/node_modules",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "OpenCode Bridge",
+      "include": "installer.nsh"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon-1024.png",
+      "category": "public.app-category.productivity",
+      "extendInfo": {
+        "NSHighResolutionCapable": true,
+        "CFBundleShortVersionString": "${version}",
+        "NSAppleEventsUsageDescription": "需要与系统交互以提供服务。",
+        "NSCameraUsageDescription": "需要访问摄像头以提供相关功能。",
+        "NSMicrophoneUsageDescription": "需要访问麦克风以提供相关功能。"
+      }
+    },
+    "dmg": {
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Network;Chat;InstantMessaging;"
+    }
   }
 }

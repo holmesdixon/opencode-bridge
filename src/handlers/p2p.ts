@@ -8,21 +8,14 @@ import {
   type CreateChatCardData,
   type CreateChatSessionOption,
 } from '../feishu/cards.js';
-import { DirectoryPolicy, type DirectorySource } from '../utils/directory-policy.js';
+import { DirectoryPolicy } from '../utils/directory-policy.js';
 import { buildSessionTimestamp } from '../utils/session-title.js';
-import { parseCommand, getHelpText, type ParsedCommand } from '../commands/parser.js';
+import { parseCommand, type ParsedCommand } from '../commands/parser.js';
 import { commandHandler } from './command.js';
 import { groupHandler } from './group.js';
 import { directoryConfig, userConfig } from '../config.js';
 
-interface EnsurePrivateSessionResult {
-  firstBinding: boolean;
-}
-
-type OpencodeSession = Awaited<ReturnType<typeof opencodeClient.listSessions>>[number];
-
-const CREATE_CHAT_OPTION_LIMIT = 100;
-const CREATE_CHAT_EXISTING_LIMIT = CREATE_CHAT_OPTION_LIMIT - 1;
+import { CREATE_CHAT_OPTION_LIMIT, CREATE_CHAT_EXISTING_LIMIT, type EnsurePrivateSessionResult, type OpencodeSession } from './p2p-types.js';
 
 export class P2PHandler {
   private static readonly CARD_SELECTION_TTL_MS = 10 * 60 * 1000; // 10 分钟
@@ -259,19 +252,90 @@ export class P2PHandler {
       ? session.directory.trim()
       : '/';
   }
-private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: boolean): string {
+
+  private getDisplayWidth(text: string): number {
+    let width = 0;
+    for (const char of text) {
+      width += /[^\u0000-\u00ff]/.test(char) ? 2 : 1;
+    }
+    return width;
+  }
+
+  private truncateByDisplayWidth(text: string, maxWidth: number, mode: 'start' | 'end' = 'end'): string {
+    const normalized = text.trim();
+    if (!normalized) {
+      return '';
+    }
+
+    if (this.getDisplayWidth(normalized) <= maxWidth) {
+      return normalized;
+    }
+
+    const ellipsis = '...';
+    const ellipsisWidth = this.getDisplayWidth(ellipsis);
+    const targetWidth = Math.max(0, maxWidth - ellipsisWidth);
+    let collected = '';
+    let usedWidth = 0;
+    const chars = [...normalized];
+    const source = mode === 'start' ? [...chars].reverse() : chars;
+
+    for (const char of source) {
+      const charWidth = this.getDisplayWidth(char);
+      if (usedWidth + charWidth > targetWidth) {
+        break;
+      }
+      collected = mode === 'start' ? `${char}${collected}` : `${collected}${char}`;
+      usedWidth += charWidth;
+    }
+
+    return mode === 'start' ? `${ellipsis}${collected}` : `${collected}${ellipsis}`;
+  }
+
+  private compactDirectoryLabel(directory: string, highlightWorkspace: boolean): string {
+    const normalized = directory.trim() || '/';
+    const shortDirectory = this.truncateByDisplayWidth(normalized, 16, 'start');
+    return shortDirectory;
+  }
+
+  private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: boolean): string {
     const title = typeof session.title === 'string' && session.title.trim().length > 0
       ? session.title.trim()
       : '未命名会话';
-    const compactTitle = title.length > 24 ? `${title.slice(0, 24)}...` : title;
+    const compactTitle = this.truncateByDisplayWidth(title, 24, 'end');
     const directory = this.getSessionDirectory(session);
-    const compactDirectory = directory.length > 18 ? `...${directory.slice(-18)}` : directory;
     const shortId = session.id.slice(0, 8);
-    const workspaceLabel = highlightWorkspace ? `【${compactDirectory}】` : compactDirectory;
+    const workspaceLabel = this.compactDirectoryLabel(directory, highlightWorkspace);
     return `${workspaceLabel} / ${shortId} / ${compactTitle}`;
   }
 
   private sortSessionsForCreateChat(sessions: OpencodeSession[]): OpencodeSession[] {
+    return [...sessions].sort((a, b) => {
+      const left = a.time?.updated ?? a.time?.created ?? 0;
+      const right = b.time?.updated ?? b.time?.created ?? 0;
+      if (left !== right) {
+        return right - left;
+      }
+
+      return a.id.localeCompare(b.id, 'en');
+    });
+  }
+
+  private async resolveSessionLastActivityMap(sessions: OpencodeSession[]): Promise<Map<string, number>> {
+    const entries = await Promise.all(
+      sessions.map(async session => {
+        try {
+          const activityTime = await opencodeClient.getSessionLastActivityTime(session.id);
+          return [session.id, activityTime || (session.time?.updated ?? session.time?.created ?? 0)] as const;
+        } catch {
+          return [session.id, session.time?.updated ?? session.time?.created ?? 0] as const;
+        }
+      })
+    );
+
+    return new Map(entries);
+  }
+
+  private sortSessionsForCreateChatDefault(sessions: OpencodeSession[]): OpencodeSession[] {
     return [...sessions].sort((a, b) => {
       const directoryCompare = this.getSessionDirectory(a).localeCompare(this.getSessionDirectory(b), 'zh-Hans-CN');
       if (directoryCompare !== 0) {
@@ -288,7 +352,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     });
   }
 
-  private async buildCreateChatCardData(selectedSessionId?: string): Promise<CreateChatCardData> {
+  private async buildCreateChatCardData(chatId: string, selectedSessionId?: string): Promise<CreateChatCardData> {
     const sessionOptions: CreateChatSessionOption[] = [
       {
         label: '新建 OpenCode 会话（默认）',
@@ -297,10 +361,25 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     ];
 
     let totalSessionCount = 0;
-    const knownDirectorySet = new Set<string>(chatSessionStore.getKnownDirectories());
+    let projectOptions: Array<{ name: string; directory: string; source: 'alias' | 'history' }> = [];
+    let sessions: OpencodeSession[] = [];
     if (userConfig.enableManualSessionBind) {
       try {
-        const sessions = this.sortSessionsForCreateChat(await opencodeClient.listSessionsAcrossProjects());
+        const sessionOrderMode = commandHandler.getSessionOrderMode(chatId);
+        const allSessions = await opencodeClient.listSessionsAcrossProjects();
+        if (sessionOrderMode === 'last_time') {
+          const sessionLastActivityMap = await this.resolveSessionLastActivityMap(allSessions);
+          sessions = [...allSessions].sort((left, right) => {
+            const leftTime = sessionLastActivityMap.get(left.id) ?? left.time?.updated ?? left.time?.created ?? 0;
+            const rightTime = sessionLastActivityMap.get(right.id) ?? right.time?.updated ?? right.time?.created ?? 0;
+            if (leftTime !== rightTime) {
+              return rightTime - leftTime;
+            }
+            return left.id.localeCompare(right.id, 'en');
+          });
+        } else {
+          sessions = this.sortSessionsForCreateChatDefault(allSessions);
+        }
         totalSessionCount = sessions.length;
 
         let previousDirectory = '';
@@ -311,31 +390,18 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
             value: session.id,
           });
           previousDirectory = directory;
-          if (session.directory) {
-            knownDirectorySet.add(session.directory);
-          }
         }
       } catch (error) {
         console.warn('[P2P] 加载 OpenCode 会话列表失败，建群卡片将仅显示新建选项:', error);
       }
     }
 
-    if (directoryConfig.defaultWorkDirectory) {
-      knownDirectorySet.add(directoryConfig.defaultWorkDirectory);
-    }
-    for (const directory of directoryConfig.allowedDirectories) {
-      if (directory) {
-        knownDirectorySet.add(directory);
-      }
-    }
-
-    const availableProjects: Array<{ name: string; directory: string; source: DirectorySource }> =
-      DirectoryPolicy.listAvailableProjects([...knownDirectorySet]);
-    const projectOptions: Array<{ name: string; directory: string; source: 'alias' | 'history' }> =
-      availableProjects.map((project: { name: string; directory: string; source: DirectorySource }) => ({
-        ...project,
-        source: project.source === 'alias' ? 'alias' : 'history',
-      }));
+    const storeKnownDirs = chatSessionStore.getKnownDirectories();
+    const knownDirs = [...new Set([...storeKnownDirs, ...sessions.map(session => session.directory).filter(Boolean)])];
+    projectOptions = DirectoryPolicy.listAvailableProjects(knownDirs).map(project => ({
+      ...project,
+      source: project.source === 'alias' ? 'alias' : 'history',
+    }));
 
     const hasSelected = sessionOptions.some(option => option.value === selectedSessionId);
     return {
@@ -354,7 +420,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     selectedSessionId?: string,
     openId?: string
   ): Promise<void> {
-    const cardData = await this.buildCreateChatCardData(selectedSessionId);
+    const cardData = await this.buildCreateChatCardData(chatId, selectedSessionId);
     const card = buildCreateChatCard(cardData);
     let sentCardMessageId: string | null = null;
     if (messageId) {
@@ -442,7 +508,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
   }
 
   private async pushFirstContactGuidance(chatId: string, senderId: string, messageId: string): Promise<void> {
-    const createChatData = await this.buildCreateChatCardData();
+    const createChatData = await this.buildCreateChatCardData(chatId);
     const card = buildWelcomeCard(senderId, createChatData);
     const welcomeCardMessageId = await feishuClient.sendCard(chatId, card);
     this.rememberCreateChatSelection(
@@ -451,7 +517,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       welcomeCardMessageId || undefined,
       senderId
     );
-    await this.safeReply(messageId, chatId, getHelpText());
+    await commandHandler.replyHelpCard(messageId, chatId, 'p2p');
 
     try {
       await commandHandler.pushPanelCard(chatId, 'p2p');
@@ -515,29 +581,63 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       console.warn(`[P2P] 用户 ${openId} 在创建群时被标记为无效，尝试手动拉取...`);
     }
 
-    let members = await feishuClient.getChatMembers(chatId);
-    if (members.includes(openId)) {
-      return { ok: true };
-    }
+    // 重试机制：飞书 createChat API 的成员添加可能是异步的，需要等待同步完成
+    const maxRetries = 3;
+    const retryDelayMs = 500;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      let members = await feishuClient.getChatMembers(chatId);
+      if (members.includes(openId)) {
+        if (attempt > 0) {
+          console.log(`[P2P] 重试 ${attempt + 1}/${maxRetries} 次后确认用户 ${openId} 在群 ${chatId} 中`);
+        }
+        return { ok: true };
+      }
 
-    console.warn(`[P2P] 用户 ${openId} 未在新建群 ${chatId} 中，尝试手动拉取...`);
-    const added = await feishuClient.addChatMembers(chatId, [openId]);
-    if (!added) {
-      return {
-        ok: false,
-        message: '❌ 无法将您添加到群聊。请确保机器人具有"获取群组信息"和"更新群组信息"权限，且您在机器人的可见范围内。',
-      };
-    }
+      // 如果是首次检查，且创建时被标记为无效，直接尝试手动拉取
+      if (attempt === 0 && userInvalidOnCreate) {
+        console.warn(`[P2P] 用户 ${openId} 未在新建群 ${chatId} 中，尝试手动拉取...`);
+        const added = await feishuClient.addChatMembers(chatId, [openId]);
+        if (!added) {
+          return {
+            ok: false,
+            message: '❌ 无法将您添加到群聊。请确保机器人具有"获取群组信息"和"更新群组信息"权限，且您在机器人的可见范围内。',
+          };
+        }
+        // 拉取成功后继续检查
+      }
 
-    members = await feishuClient.getChatMembers(chatId);
-    if (!members.includes(openId)) {
+      // 如果不是最后一次重试，等待后重试
+      if (attempt < maxRetries - 1) {
+        console.warn(`[P2P] 用户 ${openId} 尚未在群 ${chatId} 中，等待 ${retryDelayMs}ms 后重试 (${attempt + 1}/${maxRetries})...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        continue;
+      }
+
+      // 最后一次重试仍然失败，尝试手动拉取作为兜底
+      console.warn(`[P2P] 重试 ${maxRetries} 次后用户 ${openId} 仍不在群 ${chatId} 中，最后一次尝试手动拉取...`);
+      const added = await feishuClient.addChatMembers(chatId, [openId]);
+      if (!added) {
+        return {
+          ok: false,
+          message: '❌ 无法将您添加到群聊。请确保机器人具有"获取群组信息"和"更新群组信息"权限，且您在机器人的可见范围内。',
+        };
+      }
+
+      // 手动拉取后再次检查
+      members = await feishuClient.getChatMembers(chatId);
+      if (members.includes(openId)) {
+        return { ok: true };
+      }
+
       return {
         ok: false,
         message: '❌ 创建群聊异常：无法确认成员状态，已自动清理无效群。',
       };
     }
 
-    return { ok: true };
+    // 理论上不会到达这里
+    return { ok: false, message: '❌ 未知错误' };
   }
 
   private async findSessionById(sessionId: string): Promise<OpencodeSession | null> {
@@ -614,7 +714,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       protectSessionDelete = true;
       targetDirectory = selectedSession.directory;
     } else {
-      let session: Awaited<ReturnType<typeof opencodeClient.createSession>> | null = null;
+      let session;
       try {
         session = await opencodeClient.createSession(sessionTitle, effectiveDir);
       } catch (error) {
@@ -803,7 +903,19 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       this.clearCreateChatProjectSelection(chatId, messageId, openId);
       this.clearCreateChatDirectoryInput(chatId, messageId, openId);
       this.clearCreateChatNameInput(chatId, messageId, openId);
-      await this.createGroupWithSessionSelection(openId, selectedSessionId, chatId, messageId, rawDirectory, customChatName);
+      
+      // 🔧 异步执行建群逻辑，避免飞书回调超时（限制 3 秒）
+      // 后台执行，不阻塞响应
+      setImmediate(() => {
+        this.createGroupWithSessionSelection(openId, selectedSessionId, chatId, messageId, rawDirectory, customChatName)
+          .catch(error => {
+            console.error('[P2P] 后台建群失败:', error);
+            // 通过飞书消息通知用户建群失败
+            this.safeReply(messageId, chatId, `❌ 建群失败: ${error instanceof Error ? error.message : '未知错误'}`)
+              .catch(err => console.error('[P2P] 发送建群失败通知失败:', err));
+          });
+      });
+      
       return;
     }
   }

@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import dotenv from 'dotenv';
 import { directoryConfig } from '../config.js';
+import { configStore } from '../store/config-store.js';
 
 export type DirectorySource = 'explicit' | 'alias' | 'chat_default' | 'env_default' | 'server_default';
 
@@ -41,6 +43,18 @@ export interface DirectoryResolveError {
 
 export type DirectoryResolveResult = DirectoryResolved | DirectoryResolveError;
 
+/**
+ * 约束作用域：
+ * - 'platform'（默认）：平台接入（telegram/discord/qq/wecom/weixin/whatsapp/dingtalk/feishu/group/p2p
+ *   以及 /send 文件下发）必须强制 ALLOWED_DIRECTORIES 白名单，因为路径来自外部消息输入，不可信。
+ * - 'workspace'：AI 工作区（Web 管理面板内的文件树 / Git / 终端 / 新建项目对话框）。
+ *   调用方已通过管理面板身份认证，白名单和默认工作目录对其不适用 —— 只保留
+ *   格式校验、危险路径拦截、存在性/可访问性检查以及 realpath 规范化。
+ *
+ * 变更点：白名单与默认工作目录仅约束平台接入，与 AI 工作区权限脱钩。
+ */
+export type DirectoryPolicyScope = 'platform' | 'workspace';
+
 interface DirectoryResolveOptions {
   explicitDirectory?: string;
   aliasName?: string;
@@ -51,11 +65,93 @@ interface DirectoryResolveOptions {
   allowedDirectories?: string[];
   gitRootNormalization?: boolean;
   maxPathLength?: number;
+  /**
+   * 作用域，默认 'platform'。AI 工作区请传 'workspace' 以脱钩白名单约束。
+   */
+  scope?: DirectoryPolicyScope;
 }
 
 const isWindows = process.platform === 'win32';
 
 export class DirectoryPolicy {
+  private static detectAllowlistConfigMode(): {
+    mode: 'env' | 'db' | 'mixed' | 'unknown';
+    envFile?: string;
+  } {
+    const envFile = process.env.OPENCODE_BRIDGE_ACTIVE_ENV_FILE?.trim();
+    const migrated = configStore.isMigrated();
+
+    let envHasAllowlist = false;
+    if (envFile) {
+      try {
+        const content = fs.readFileSync(envFile, 'utf-8');
+        const parsed = dotenv.parse(content);
+        envHasAllowlist = typeof parsed.ALLOWED_DIRECTORIES === 'string'
+          && parsed.ALLOWED_DIRECTORIES.trim().length > 0;
+      } catch {
+        // ignore
+      }
+    }
+
+    if (envHasAllowlist && migrated) {
+      return { mode: 'mixed', envFile };
+    }
+
+    if (envHasAllowlist) {
+      return { mode: 'env', envFile };
+    }
+
+    if (migrated) {
+      return { mode: 'db' };
+    }
+
+    if (envFile) {
+      return { mode: 'env', envFile };
+    }
+
+    return { mode: 'unknown' };
+  }
+
+  private static buildAllowlistGuidance(): string {
+    return '请在 Web 管理面板的“核心行为 -> 工作目录与项目 -> 允许的目录白名单（ALLOWED_DIRECTORIES）”中添加或修改目录\n管理面板地址：http://localhost:4098';
+  }
+
+  private static buildAllowlistUserMessage(
+    rawPath: string,
+    variant: 'not_allowed' | 'missing_allowlist',
+    allowedDirectories: string[]
+  ): string {
+    const detected = this.detectAllowlistConfigMode();
+    const sourceText =
+      detected.mode === 'env' ? '配置来源：.env' :
+      detected.mode === 'db' ? '配置来源：Web 管理面板 / SQLite' :
+      detected.mode === 'mixed' ? '配置来源：混合模式（当前 .env 优先）' :
+      '配置来源：未识别';
+    const allowlistText = allowedDirectories.length > 0
+      ? `当前允许目录：${allowedDirectories.join(' | ')}`
+      : '当前允许目录：未配置';
+    const title = variant === 'missing_allowlist'
+      ? '未配置允许目录，禁止使用用户输入路径'
+      : '目录不在允许范围内';
+
+    return `${title}\n尝试目录：${rawPath}\n${sourceText}\n${allowlistText}\n${this.buildAllowlistGuidance()}`;
+  }
+
+  static buildProjectListEmptyMessage(): string {
+    const detected = this.detectAllowlistConfigMode();
+    const allowlist = directoryConfig.allowedDirectories;
+    const sourceText =
+      detected.mode === 'env' ? '配置来源：.env' :
+      detected.mode === 'db' ? '配置来源：Web 管理面板 / SQLite' :
+      detected.mode === 'mixed' ? '配置来源：混合模式（当前 .env 优先）' :
+      '配置来源：未识别';
+    const allowlistText = allowlist.length > 0
+      ? `当前允许目录：${allowlist.join(' | ')}`
+      : '当前允许目录：未配置';
+
+    return `暂无可用项目\n${sourceText}\n${allowlistText}\n${this.buildAllowlistGuidance()}\n也可通过 PROJECT_ALIASES 配置项目别名`;
+  }
+
   // 解析并校验目录（九阶段）
   static resolve(options?: DirectoryResolveOptions): DirectoryResolveResult {
     const explicitDirectory = options?.explicitDirectory?.trim();
@@ -67,6 +163,9 @@ export class DirectoryPolicy {
     const allowedDirectories = options?.allowedDirectories ?? directoryConfig.allowedDirectories;
     const gitRootNormalization = options?.gitRootNormalization ?? directoryConfig.gitRootNormalization;
     const maxPathLength = options?.maxPathLength ?? directoryConfig.maxPathLength;
+    const scope: DirectoryPolicyScope = options?.scope ?? 'platform';
+    // AI 工作区脱钩白名单：Web 管理面板已做过身份认证，允许浏览服务进程可访问的任意目录。
+    const enforceAllowlist = scope !== 'workspace';
 
     // 1) 优先级合并
     let raw = '';
@@ -158,27 +257,29 @@ export class DirectoryPolicy {
       };
     }
 
-    // 5) 允许目录校验
+    // 5) 允许目录校验（仅平台接入作用域生效；AI 工作区脱钩）
     const normalizedAllowed = this.normalizeAllowedDirectories(allowedDirectories);
-    if (normalizedAllowed.length > 0) {
-      if (!this.isPathAllowed(normalized, normalizedAllowed)) {
+    if (enforceAllowlist) {
+      if (normalizedAllowed.length > 0) {
+        if (!this.isPathAllowed(normalized, normalizedAllowed)) {
+          return {
+            ok: false,
+            code: 'not_allowed',
+            userMessage: this.buildAllowlistUserMessage(raw, 'not_allowed', allowedDirectories),
+            internalDetail: `不在允许范围: ${normalized}`,
+            ...(source ? { source } : {}),
+            raw,
+          };
+        }
+      } else if (source === 'explicit') {
         return {
           ok: false,
-          code: 'not_allowed',
-          userMessage: '目录不在允许范围内',
-          internalDetail: `不在允许范围: ${normalized}`,
-          ...(source ? { source } : {}),
+          code: 'explicit_requires_allowlist',
+          userMessage: this.buildAllowlistUserMessage(raw, 'missing_allowlist', allowedDirectories),
+          internalDetail: 'explicit 输入需要 ALLOWED_DIRECTORIES',
           raw,
         };
       }
-    } else if (source === 'explicit') {
-      return {
-        ok: false,
-        code: 'explicit_requires_allowlist',
-        userMessage: '未配置允许目录，禁止使用用户输入路径',
-        internalDetail: 'explicit 输入需要 ALLOWED_DIRECTORIES',
-        raw,
-      };
     }
 
     // 6) 存在性与可访问性
@@ -233,12 +334,12 @@ export class DirectoryPolicy {
       };
     }
 
-    if (normalizedAllowed.length > 0 && realpath !== normalized) {
+    if (enforceAllowlist && normalizedAllowed.length > 0 && realpath !== normalized) {
       if (!this.isPathAllowed(realpath, normalizedAllowed)) {
         return {
           ok: false,
           code: 'realpath_not_allowed',
-          userMessage: '目录不在允许范围内',
+          userMessage: this.buildAllowlistUserMessage(raw, 'not_allowed', allowedDirectories),
           internalDetail: `realpath 超出允许范围: ${realpath}`,
           ...(source ? { source } : {}),
           raw,
@@ -262,13 +363,13 @@ export class DirectoryPolicy {
       }
     }
 
-    // 9) Git 根目录归一化后的允许目录复检
-    if (gitRoot && gitRoot !== realpath) {
+    // 9) Git 根目录归一化后的允许目录复检（仅平台接入作用域生效）
+    if (enforceAllowlist && gitRoot && gitRoot !== realpath) {
       if (normalizedAllowed.length > 0 && !this.isPathAllowed(gitRoot, normalizedAllowed)) {
         return {
           ok: false,
           code: 'git_root_not_allowed',
-          userMessage: '目录不在允许范围内',
+          userMessage: this.buildAllowlistUserMessage(raw, 'not_allowed', allowedDirectories),
           internalDetail: `git 根目录超出允许范围: ${gitRoot}`,
           ...(source ? { source } : {}),
           raw,

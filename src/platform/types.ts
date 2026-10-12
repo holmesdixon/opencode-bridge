@@ -4,7 +4,7 @@
 /**
  * 平台标识符
  */
-export type PlatformId = 'feishu' | 'discord' | string;
+export type PlatformId = 'feishu' | 'discord' | 'wecom' | 'telegram' | 'qq' | 'whatsapp' | 'weixin' | 'dingtalk' | string;
 
 /**
  * 聊天类型
@@ -165,4 +165,7 @@ export interface PlatformAdapter {
 
   // 监听群解散事件
   onChatDisbanded?(callback: (conversationId: string) => void): void;
+
+  // Discord 特有：监听交互事件（按钮、选择菜单等）
+  onInteraction?(callback: (interaction: unknown) => void): void;
 }
